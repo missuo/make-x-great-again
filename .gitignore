@@ -17,3 +17,6 @@ dist/
 apple/**/xcuserdata/
 apple/Config/Signing.local.xcconfig
 *.xcuserstate
+
+# 训练语料（数十 MB，可从 /v1/list 重新拉取；不入库）
+data/baseline/corpus/

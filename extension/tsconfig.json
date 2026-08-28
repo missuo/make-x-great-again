@@ -2,6 +2,9 @@
   "extends": "./.wxt/tsconfig.json",
   "compilerOptions": {
     "strict": true,
+    // 共用 ../src/baseline/* —— 主工程用 node16 解析，要求显式 .ts 后缀。
+    // 扩展侧由 Vite 打包（不产出 JS），开启这个开关即可消化那些后缀。
+    "allowImportingTsExtensions": true,
     "noUncheckedIndexedAccess": true,
     "jsx": "react-jsx"
   }

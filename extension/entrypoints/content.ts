@@ -1,18 +1,20 @@
+import { PROMOTE_MIN_ACCOUNTS, describeRule } from "../../src/baseline/learned.ts";
 import { hideAccountSurface } from "../lib/account-surface";
-import { autoEligible, capAutoTierAction } from "../lib/auto-policy";
+import { autoEligible } from "../lib/auto-policy";
+import { type LocalVerdict, baselineStats, scoreSignals } from "../lib/baseline";
 import { addBlocked, isBlockedSync, warm as warmBlocklist } from "../lib/blocklist";
 import { BRAND } from "../lib/brand";
-import { type Cached, cacheGet, signalsHash } from "../lib/cache";
+import { type Cached, cacheGet, cacheSet, signalsHash } from "../lib/cache";
+import { CATEGORY_ZH } from "../lib/category";
 import {
   extractFromArticle,
   extractProfile,
   extractThreadTopic,
   viewerHandle,
 } from "../lib/detect";
-import { CATEGORY_ZH } from "../lib/category";
+import { type DistillLogEntry, learnedRules, warmLearned } from "../lib/learned-store";
 import { LIST_KEY, WL_KEY } from "../lib/list-sync";
-import { type IndexEntry, isWhitelisted, lookupLocal, warmLocalIndex } from "../lib/local-index";
-import { matchLocalRules } from "../lib/local-rules";
+import { type IndexEntry, isWhitelisted, warmLocalIndex } from "../lib/local-index";
 import {
   type ActionMode,
   type CategoryAction,
@@ -31,6 +33,7 @@ import {
   getPendingActions,
   updateBlockRecord,
 } from "../lib/store";
+import { recordSample } from "../lib/training";
 import type { Signals, Verdict } from "../lib/types";
 import {
   type BadgeSource,
@@ -40,6 +43,81 @@ import {
   createBadge,
   createBubble,
 } from "../lib/ui";
+
+/**
+ * 手动拉黑 → 后台蒸馏出候选规则。
+ *
+ * 整条链路都是 fire-and-forget：蒸馏失败（没配大模型、网络断了、返回的
+ * JSON 不合法）绝不能影响用户已经完成的那次拉黑。学不到就下次再学。
+ *
+ * 但**每一次都要在页面控制台留话**。之前只在学到东西时打日志，于是
+ * 「没配 AI」「模型没给签名」「签名被体检拒了」「网络挂了」四种情况在
+ * 用户看来完全一样，都是沉默 —— 而它们需要的处理完全不同。同一条记录
+ * 也会落进设置页的「最近学习记录」，因为 service worker 的控制台不是
+ * 用户会去看的地方。
+ */
+function distillFromManual(sig: Signals): void {
+  void (async () => {
+    let log: DistillLogEntry | undefined;
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: "distill", sig });
+      log = resp?.data as DistillLogEntry | undefined;
+    } catch {
+      /* 后台不可用 */
+    }
+    if (!log) {
+      console.info(`[MXGA] 学习 @${sig.handle} —— 后台无响应，本次未学习`);
+      return;
+    }
+    const tail = " · 详见设置页「模型学习 → 最近学习记录」";
+    switch (log.status) {
+      case "added":
+        console.info(
+          `[MXGA] 从 @${sig.handle} 学到 ${log.added.length} 条候选规则：${log.added.join("；")}`,
+        );
+        break;
+      case "all_rejected":
+        console.info(
+          `[MXGA] 学习 @${sig.handle} —— AI 给出的候选全部未通过准入体检：${log.rejected
+            .map((r) => `「${r.terms.join("+")}」${r.reason}`)
+            .join("；")}`,
+        );
+        break;
+      case "no_signatures":
+        console.info(`[MXGA] 学习 @${sig.handle} —— AI 认为它身上没有可复用的特征${tail}`);
+        break;
+      case "not_configured":
+        console.info(`[MXGA] 学习 @${sig.handle} —— 尚未配置 AI 判定接口，无法学习${tail}`);
+        break;
+      default:
+        console.info(`[MXGA] 学习 @${sig.handle} 失败：${log.error ?? "未知错误"}${tail}`);
+    }
+  })();
+}
+
+/**
+ * 手动拉黑 → 把那条推文原文留存为模板规则。
+ *
+ * 和蒸馏刻意分开：蒸馏依赖 AI，会因为没配接口、网络故障、或模型认为
+ * 「抽不出可复用特征」而一无所获；这一路是纯本地计算，只要按了拉黑就
+ * 一定留下证据。同一批号往往只换句尾和 @目标，靠相似度就能覆盖。
+ */
+function captureTemplateFromManual(sig: Signals): void {
+  void (async () => {
+    try {
+      const { captureTemplate } = await import("../lib/learned-store");
+      const tweet = sig.triggeringComment || sig.recentTweets[0];
+      const rep = await captureTemplate(tweet);
+      if (rep.added.length) {
+        console.info(`[MXGA] 已留存推文模板，后续相似推文将直接处理：${tweet?.slice(0, 40)}`);
+      } else if (rep.rejected.length) {
+        console.info(`[MXGA] 推文模板未留存：${rep.rejected[0]?.reason}`);
+      }
+    } catch {
+      /* 非致命 */
+    }
+  })();
+}
 
 /** "误判申诉" — opens the GitHub appeal issue template, PRE-FILLED with the
  *  account's handle / user id / title so the user only writes the reason and
@@ -219,9 +297,7 @@ function mountBadge(anchor: HTMLElement, build: () => HTMLElement) {
 }
 
 function clearMounts(anchor: HTMLElement) {
-  anchor
-    .querySelectorAll(":scope > .xss-mount, :scope > .xss-pending")
-    .forEach((n) => n.remove());
+  anchor.querySelectorAll(":scope > .xss-mount, :scope > .xss-pending").forEach((n) => n.remove());
 }
 
 // ---- 5-second preview undo queue (PENDING_MS) ----
@@ -259,13 +335,62 @@ export default defineContentScript({
     if (!settings.enabled) return; // master off → don't init (applies next load)
     // Build marker — confirms which content-script build is live in this tab
     // (reloading the unpacked extension does NOT refresh already-open tabs).
-    console.info("[MXGA] content script ready · build 2026-07-24 (profile-pending-settle)");
+    console.info(
+      // 构建标识必须随每次改动更新：上一次排查里，页面上挂着的旧脚本打出了
+      // 和新版一模一样的这行，导致「扩展重载了但标签页没重载」看起来像是
+      // 判定失效。带上模型规模，顺便一眼确认 baseline 真的加载进来了。
+      // 构建标识必须能回答「我加载的是不是新版本」。上一轮排查里，
+      // 「没学到规则」和「装的还是旧构建」在外部看来完全一样 —— 把学习
+      // 层的状态直接写进这一行，这个歧义就不会再出现。
+      `[MXGA] content script ready · build 2026-08-12 (self-learning) · 模板 ${baselineStats().clusters} 簇 / 定罪短语 ${baselineStats().phrases} 条 · 学习规则 ${learnedRules().length} 条（可信 ${learnedRules().filter((r) => r.status === "trusted").length}）`,
+    );
+
+    // 判定计数。只打非 pass 的日志会留下一个致命的观测盲区：「扫到了但
+    // 全部放行」和「根本没扫到账号」在控制台里长得一模一样，排查时无法
+    // 区分。定期汇总一次，让「在工作但很安静」可被证实。
+    const tally = { ban: 0, llm: 0, pass: 0 };
+    // 抽样保留 baseline 实际收到的输入。判定全放行时，必须能分清是「确实
+    // 没有垃圾号」还是「输入是空的」—— baseline 几乎全靠 displayName，
+    // 昵称提取失败会导致 100% 放行，而这在计数上和前者一模一样。
+    const seen: string[] = [];
+    let lastTallyTotal = 0;
+    const tallyTimer = setInterval(() => {
+      const total = tally.ban + tally.llm + tally.pass;
+      if (total === lastTallyTotal) return; // 没有新增就不刷屏
+      lastTallyTotal = total;
+      console.info(
+        `[MXGA] 已评估 ${total} 个账号 · 定罪 ${tally.ban} · 送大模型 ${tally.llm} · 放行 ${tally.pass}`,
+      );
+      if (seen.length) {
+        console.info(
+          `[MXGA] baseline 看到的输入抽样（昵称为空说明提取失败）:\n  ${seen.join("\n  ")}`,
+        );
+        seen.length = 0;
+      }
+    }, 10_000);
+    ctx.onInvalidated?.(() => clearInterval(tallyTimer));
+
+    // 孤儿脚本自检。
+    //
+    // 重载扩展不会踢掉已经注入页面的旧内容脚本，而 X 是 SPA，站内跳转也
+    // 不会重新注入 —— 于是旧脚本继续跑，它的 chrome.runtime 已经失效，
+    // 存储读不到、消息发不出，表现就是「什么都不发生」。整整一轮排查卡在
+    // 这里，因为它**静默**失败：控制台只有一条 chrome-extension://invalid/。
+    // 与其让下一次再猜一遍，不如让它自己喊出来。
+    const orphanCheck = setInterval(() => {
+      if (chrome.runtime?.id) return;
+      clearInterval(orphanCheck);
+      console.error(
+        "[MXGA] 扩展上下文已失效 —— 本页运行的是旧版内容脚本，所有检测与处理都不会生效。请刷新此页面。",
+      );
+    }, 5000);
+    ctx.onInvalidated?.(() => clearInterval(orphanCheck));
     onSettingsChange((s) => {
       const modeChanged = s.actionMode !== settings.actionMode;
       settings = s;
       // Keep the bubble's 自动处理 switch + hint in sync (options page or
       // another tab may have flipped it).
-      bubbleApi?.setAutoProcess(s.autoProcess, autoCategoryCount(s), s.autoScope === "all");
+      bubbleApi?.setAutoProcess(s.autoProcess, autoCategoryCount(s));
       bubbleApi?.setAutoExpand(s.autoExpand);
       if (modeChanged) {
         // Mounted badges rendered the OLD verb into their buttons, but a
@@ -284,6 +409,8 @@ export default defineContentScript({
     // Warm local data structures
     await warmBlocklist();
     await warmLocalIndex();
+    // 学到的规则也要预热：判定是同步的，拿不到就等于这一层不存在。
+    await warmLearned();
 
     const keyOf = (s: Signals) => s.userId || `h:${s.handle}`;
 
@@ -349,6 +476,17 @@ export default defineContentScript({
       const tweetText = pend?.tweetText ?? fin?.snippet;
       void addBlocked(key);
       if (sig.userId) void addBlocked(sig.userId);
+      // 人工确认的正样本 —— 用户亲手判断过，这是训练集里质量最高的一档。
+      // 快照必须在这里抓：账号随后就从页面消失，事后无从还原特征。
+      void recordSample(sig, "spam", "manual");
+      // 自学习循环 1：让大模型从这个账号身上蒸馏可复用签名。只对**手动**
+      // 拉黑做 —— 自动处理是模型自己的判断，拿它去教自己会正反馈跑偏；
+      // 手动拉黑背后是一次真人 review，这才是新信息的来源。
+      void distillFromManual(sig);
+      // 与蒸馏并行的第二条路：把这条推文原文本身留存为模板规则。
+      // 纯本地、不联网 —— AI 抽不出关键词（或根本没配）时，它是唯一
+      // 仍然会留下证据的一路。同一批号只换尾巴时靠相似度就能抓住。
+      void captureTemplateFromManual(sig);
       void addBlockRecord({
         id: key,
         handle: sig.handle,
@@ -356,6 +494,7 @@ export default defineContentScript({
         ...(sig.avatarUrl ? { avatarUrl: sig.avatarUrl } : {}),
         ...(tweetId ? { tweetId } : {}),
         ...(tweetText ? { tweetText } : {}),
+        ...(mode === "mute" || mode === "block" ? { xAction: mode } : {}),
         source: "manual",
         ts: Date.now(),
       });
@@ -364,8 +503,7 @@ export default defineContentScript({
       // X recycles article nodes: only hide via the captured anchor if it
       // still belongs to this account; otherwise use the tagged row, else
       // abort the DOM hide (the block itself is already recorded).
-      const anchor =
-        pendingActions.get(key)?.anchor ?? anchorByKey.get(key) ?? null;
+      const anchor = pendingActions.get(key)?.anchor ?? anchorByKey.get(key) ?? null;
       const art = articleOf(anchor);
       const sameAuthor =
         !!art && handleFromArticle(art)?.toLowerCase() === sig.handle.toLowerCase();
@@ -398,6 +536,8 @@ export default defineContentScript({
         if (!ok) {
           void updateBlockRecord(key, {
             reason: `手动${actionVerb(mode)}（X 动作失败，仅本地隐藏）`,
+            // 动作没成功就不能留 xAction，否则恢复时会去解除一个从未生效的拉黑
+            xAction: undefined,
           });
         }
         return ok;
@@ -460,12 +600,9 @@ export default defineContentScript({
      *  still renders this account, else fall back to the tagged row. */
     function autoTarget(it: AutoItem): HTMLElement | null {
       const art = articleOf(it.anchor);
-      const same =
-        !!art && handleFromArticle(art)?.toLowerCase() === it.sig.handle.toLowerCase();
+      const same = !!art && handleFromArticle(art)?.toLowerCase() === it.sig.handle.toLowerCase();
       if (same) return it.anchor;
-      return document.querySelector<HTMLElement>(
-        `[data-xss-key="${CSS.escape(it.key)}"]`,
-      );
+      return document.querySelector<HTMLElement>(`[data-xss-key="${CSS.escape(it.key)}"]`);
     }
 
     function enqueueAuto(it: AutoItem) {
@@ -475,6 +612,9 @@ export default defineContentScript({
       // animation never gets to play.
       void addBlocked(it.key);
       if (it.sig.userId) void addBlocked(it.sig.userId);
+      // 自动处理只算弱正样本：没人复核过，训练时应当降权。用户若随后
+      // 点了「恢复显示」，这条会被同 id 覆盖成负样本。
+      void recordSample(it.sig, "spam", "auto", it.verdict?.reasons?.[0]);
       // The 处理记录 row too: the id lands in xss:blocked above, and a record
       // is the only UI path back (恢复显示). Writing it after the paced X
       // action left a window (tab close mid-queue) that produced permanently
@@ -489,7 +629,12 @@ export default defineContentScript({
         ...(it.tweetId ? { tweetId: it.tweetId } : {}),
         ...(tweetText ? { tweetText } : {}),
         verdict: it.verdict,
-        reason: `${it.categoryZh} · 自动${it.verb}`,
+        // 证据进记录，而不只是「类别 · 动作」。处理记录是唯一的复核入口，
+        // 一条看不出凭什么发生的自动处理，等于没法复核。
+        reason: [`${it.categoryZh} · 自动${it.verb}`, it.verdict?.reasons?.[0]]
+          .filter(Boolean)
+          .join(" · "),
+        ...(it.action === "mute" || it.action === "block" ? { xAction: it.action } : {}),
         source: "auto",
         ts: Date.now(),
       });
@@ -523,10 +668,7 @@ export default defineContentScript({
       if (autoDraining) return; // mid-sweep hits just join the tail
       const now = Date.now();
       if (!gatherStart) gatherStart = now;
-      const delay = Math.min(
-        AUTO_GATHER_MS,
-        Math.max(0, gatherStart + AUTO_GATHER_MAX_MS - now),
-      );
+      const delay = Math.min(AUTO_GATHER_MS, Math.max(0, gatherStart + AUTO_GATHER_MAX_MS - now));
       clearTimeout(drainTimer);
       drainTimer = setTimeout(() => void drainAuto(), delay);
     }
@@ -577,7 +719,13 @@ export default defineContentScript({
             void clearPendingAction(it.key);
             if (!xOk) {
               void updateBlockRecord(it.key, {
-                reason: `${it.categoryZh} · 自动${it.verb}（X 动作失败，仅本地隐藏）`,
+                reason: [
+                  `${it.categoryZh} · 自动${it.verb}（X 动作失败，仅本地隐藏）`,
+                  it.verdict?.reasons?.[0],
+                ]
+                  .filter(Boolean)
+                  .join(" · "),
+                xAction: undefined,
               });
             }
           }
@@ -641,9 +789,7 @@ export default defineContentScript({
       // producing two different keys — the bubble then listed it twice.
       const h = sig.handle.toLowerCase();
       if (
-        findings.some(
-          (f) => (f.userId || `h:${f.handle}`) === id || f.handle.toLowerCase() === h,
-        )
+        findings.some((f) => (f.userId || `h:${f.handle}`) === id || f.handle.toLowerCase() === h)
       )
         return;
       const snippet = sig.triggeringComment || sig.recentTweets[0] || sig.bio;
@@ -700,13 +846,14 @@ export default defineContentScript({
       pushFinding(sig, c.verdict, "cache");
     }
 
-    function renderLocalIndex(
+    /** 一次定罪的渲染与执行。来源只可能是本地 baseline 或大模型判定 ——
+     *  公榜与官方关键词规则两条来源已整个移除。 */
+    function renderHit(
       anchor: HTMLElement,
       key: string,
       sig: Signals,
       entry: IndexEntry,
-      badgeSource: BadgeSource = "list",
-      ctx: ScanContext = "feed",
+      badgeSource: "baseline" | "llm",
     ) {
       if (!hitPublicSeen.has(key)) {
         hitPublicSeen.add(key);
@@ -715,54 +862,32 @@ export default defineContentScript({
       // Triggering tweet for the audit trail (null on profile headers).
       const hitArt = articleOf(anchor);
       const hitTweetId = hitArt ? articleStatusId(hitArt) : null;
-      // Auto-action decision chain (each gate independent, no cross-talk):
-      //   1. ELIGIBILITY — autoEligible() in lib/auto-policy.ts: list hits
-      //      per autoScope; rule hits reply-section-only; cache/fresh never.
-      //      autoTierMode "badge" gates out everything not human-confirmed
-      //      (auto-tier list entries AND rule hits — both are 自动收录).
-      //   2. TIER CAP — capAutoTierAction(): under autoTierMode "hide",
-      //      anything not human-confirmed is capped at the local hide.
-      //      entry.tier (人工确认/自动收录) stays visible in the popover;
-      //      /v1/check keeps the human-tier filter for legacy clients.
-      //   3. MASTER SWITCH — settings.autoProcess (bubble + settings page).
-      //   4. POLICY — per-category action (badge/hide/mute/block).
-      // (Auto actions stay reversible from the 处理记录 tab, and mute/block
-      // ride the user's own X session like the manual path.)
-      const eligible = autoEligible({
-        source: badgeSource,
-        tier: entry.tier,
-        inReply: ctx === "reply",
-        autoScope: settings.autoScope,
-        autoTierMode: settings.autoTierMode,
-      });
-      // Auto-published (non-human) list entries are capped by autoTierMode:
-      // under the default "hide" they may auto-hide locally but never fire
-      // the irreversible X mute/block with the user's session.
-      const action = eligible
-        ? capAutoTierAction(settings.categoryActions[entry.category] ?? "badge", {
-            source: badgeSource,
-            tier: entry.tier,
-            autoTierMode: settings.autoTierMode,
-          })
+      // 自动处理决策链（两道闸，互不干扰）：
+      //   1. 来源资格 —— autoEligible()：只有 baseline / 大模型判定算数，
+      //      缓存与中性判定永不自动处理。
+      //   2. 总开关 —— settings.autoProcess（气泡与设置页同步）。
+      //   3. 动作 —— 按类别配置（仅标记 / 本地隐藏 / X 静音 / X 拉黑）。
+      // 自动处理一律可在「处理记录」撤销；静音/拉黑与手动路径一样走用户
+      // 自己的 X 登录态。
+      const action = autoEligible({ source: badgeSource })
+        ? (settings.categoryActions[entry.category] ?? "badge")
         : "badge";
       // 自动处理 master switch off → everything degrades to mark-only,
       // regardless of the per-category policy.
       if (action === "badge" || !settings.autoProcess) {
         badgeFor(anchor, key, sig, entry.verdict, undefined, badgeSource);
-        pushFinding(sig, entry.verdict, badgeSource === "rule" ? "local-rule" : "local-index", {
+        pushFinding(sig, entry.verdict, "local-index", {
           categoryZh: CATEGORY_ZH[entry.category],
           ...(hitTweetId ? { tweetId: hitTweetId } : {}),
-          ...(badgeSource === "list" ? { tier: entry.tier } : {}),
         });
         return;
       }
       // Auto-processed accounts still show up in the bubble panel — as
       // display-only rows driven through markAuto (checkbox disabled,
       // button is a status chip). Chips + radar pill counts follow.
-      pushFinding(sig, entry.verdict, badgeSource === "rule" ? "local-rule" : "local-index", {
+      pushFinding(sig, entry.verdict, "local-index", {
         categoryZh: CATEGORY_ZH[entry.category],
         ...(hitTweetId ? { tweetId: hitTweetId } : {}),
-        ...(badgeSource === "list" ? { tier: entry.tier } : {}),
       });
       const verb = action === "mute" ? "静音" : action === "block" ? "拉黑" : "隐藏";
       // The visible queue owns everything from here: records up-front, then
@@ -779,6 +904,94 @@ export default defineContentScript({
         categoryZh: CATEGORY_ZH[entry.category],
         ...(hitTweetId ? { tweetId: hitTweetId } : {}),
       });
+    }
+
+    /**
+     * baseline 中间带 → 大模型判定 → 落缓存 → 按结果决定动作。
+     *
+     * 只有 spam / porn_bot 才执行动作。likely_spam / uncertain 一律只标记：
+     * 实测这个模型的 confidence 恒为 0.85（未校准），所以不能靠置信度阈值
+     * 把握精度，只能靠标签本身 —— 而 likely_spam 按定义就是「不确定」。
+     */
+    async function classifyLlm(
+      anchor: HTMLElement,
+      key: string,
+      sig: Signals,
+      base: LocalVerdict,
+      ctx: ScanContext,
+    ) {
+      let verdict: Verdict | undefined;
+      try {
+        const resp = await chrome.runtime.sendMessage({ type: "classify", sig });
+        if (resp?.ok) verdict = resp.data as Verdict;
+      } catch {
+        /* background 不可用 / 网络错误 —— 下面按未判定处理 */
+      }
+      // 判不出来就不判 —— 绝不因为「模型没答上来」而默认成 spam。
+      if (!verdict) {
+        console.info(`[MXGA] 大模型未给出判定 @${sig.handle} —— 按未判定处理，不做任何动作`);
+        badgeFor(anchor, key, sig, null);
+        return;
+      }
+      console.info(
+        `[MXGA] 大模型 @${sig.handle} → ${verdict.label} ${verdict.confidence} · ${verdict.reasons[0] ?? ""}`,
+      );
+      // 落缓存：账号级，避免同一个账号在别的推文下再烧一次调用。
+      void cacheSet(key, {
+        verdict,
+        signalsHash: signalsHash(sig),
+        model: "llm",
+        ts: Date.now(),
+        handle: sig.handle,
+        displayName: sig.displayName,
+        ...(sig.avatarUrl ? { avatarUrl: sig.avatarUrl } : {}),
+      });
+      // detections 就是「已执行的 LLM 判定次数」，复用它而不是另造字段
+      void bumpStats({ detections: 1, label: verdict.label });
+
+      const actionable = verdict.label === "spam" || verdict.label === "porn_bot";
+      // 自学习循环 3：这次送审若是被某条候选规则提起来的，把结果记到它头上。
+      //
+      // 只认两个明确的极端：spam/porn_bot 记一次确认，legit 当场退役。
+      // likely_spam / uncertain 什么都不记 —— 模型自己都没想好，不该拿它
+      // 去推动一条规则升级或退役。
+      if (base.learnedRuleId && (actionable || verdict.label === "legit")) {
+        void (async () => {
+          const { recordOutcome } = await import("../lib/learned-store");
+          const after = await recordOutcome(
+            base.learnedRuleId as string,
+            key,
+            actionable ? "spam" : "legit",
+            verdict.label === "legit" ? `大模型判定 @${sig.handle} 为正常账号` : undefined,
+          );
+          if (after?.status === "trusted" && after.confirms === PROMOTE_MIN_ACCOUNTS) {
+            console.info(`[MXGA] 学习规则已晋升为可自动定罪：${describeRule(after)}`);
+          } else if (after?.status === "retired") {
+            console.info(`[MXGA] 学习规则已退役：${describeRule(after)} · ${after.retiredReason}`);
+          }
+        })();
+      }
+      if (!actionable) {
+        badgeFor(anchor, key, sig, verdict, undefined, "llm");
+        pushFinding(sig, verdict, "llm");
+        return;
+      }
+      renderHit(
+        anchor,
+        key,
+        sig,
+        {
+          userId: sig.userId ?? "",
+          handle: sig.handle,
+          verdict,
+          // baseline 的中间带证据带着类别；模型只回标签，用前者补齐。
+          category: base.category,
+          tier: "confirmed",
+          source: "curated",
+          updatedAt: new Date().toISOString(),
+        },
+        "llm",
+      );
     }
 
     async function process(sig: Signals, anchor: HTMLElement, ctx: ScanContext = "feed") {
@@ -800,10 +1013,7 @@ export default defineContentScript({
           (sig.userId && isBlockedSync(sig.userId)) ||
           isBlockedSync(`h:${sig.handle}`)
         ) {
-          if (
-            autoActing.has(key) &&
-            articleOf(anchor)?.getAttribute("data-xss-key") === key
-          )
+          if (autoActing.has(key) && articleOf(anchor)?.getAttribute("data-xss-key") === key)
             return;
           hideAccountSurface(anchor);
           return;
@@ -812,25 +1022,71 @@ export default defineContentScript({
         // 1. Check pending undo queue — skip if already scheduled.
         if (pendingActions.has(key)) return;
 
-        // 2. Whitelist wins over EVERYTHING below — lookupLocal excludes
-        //    whitelisted accounts itself, but a v0.4-era cached spam verdict
-        //    would otherwise keep red-badging an appealed account for up to
-        //    30 days. Still mount the neutral badge: it keeps the manual
-        //    handle available and stops scan() from revisiting the row.
+        // 2. 白名单压倒下面的一切。公榜切掉之后它依然保留 —— 它只会
+        //    「阻止」动作，从不产生动作，是对 baseline / 大模型自身误判
+        //    的最后一道保险。同时也拦住 v0.4 时代残留的缓存判定。
         if (isWhitelisted(sig.userId, sig.handle)) {
           badgeFor(anchor, key, sig, null);
           return;
         }
 
-        // 3. Local public index lookup (no remote requests, <50ms). Ranked
-        //    ABOVE the legacy cache: a stale "legit" entry from v0.4 must not
-        //    mask a since-human-confirmed list hit, and a stale "spam" entry
-        //    must not demote it to mark-only (cache never auto-acts).
-        const entry = lookupLocal(sig.userId, sig.handle);
-        if (entry) {
-          renderLocalIndex(anchor, key, sig, entry, "list", ctx);
+        // 2.5 本地 baseline —— 排在远端公榜之前，因为它是我们自己的判定。
+        //     公榜里 27.7% 的条目由泛化词（"同城"/"vpn"/"主页"）单独命中
+        //     产生，是已确认的误杀来源；baseline 只在三条结构性高精度路径
+        //     上定罪，够不到就不表态。让本地判定先说话，命中即执行。
+        const base = scoreSignals(sig);
+        tally[base.decision]++;
+        if (seen.length < 8) {
+          seen.push(
+            `@${sig.handle} 昵称=${JSON.stringify(sig.displayName)} 简介=${JSON.stringify((sig.bio ?? "").slice(0, 40))} 推文数=${sig.recentTweets.length} 年龄=${sig.accountAgeDays ?? "?"}`,
+          );
+        }
+        if (base.decision !== "pass") {
+          // 判定留痕。没有这个，「安静」和「坏了」在外部看来完全一样 ——
+          // 上一次排查就卡在这里。也让每一条处理当场可复核，而不用事后
+          // 去翻处理记录。
+          console.info(
+            `[MXGA] baseline ${base.decision} @${sig.handle} ${JSON.stringify(sig.displayName)} · ${base.reasons[0] ?? ""}`,
+          );
+        }
+        if (base.decision === "ban") {
+          renderHit(
+            anchor,
+            key,
+            sig,
+            {
+              userId: sig.userId ?? "",
+              handle: sig.handle,
+              verdict: {
+                label: base.category === "porn" ? "porn_bot" : "spam",
+                confidence: 1,
+                // 写出命中的**具体**证据（哪条短语 / 哪个模板 / 相似度多少）。
+                //
+                // 这里曾经只写「本地模型命中 · 类别」，理由是垃圾号会截图
+                // 自己的封禁页、泄露关键词等于送出绕过配方。但那个取舍把
+                // 审计能力一起掐掉了：维护者自己也看不出一条处理凭什么发生，
+                // 于是「误判可在处理记录复核」就成了一句空话。证据必须留下 ——
+                // 一条无法复核的自动处理，和一条错误的自动处理一样危险。
+                reasons: base.reasons.length
+                  ? base.reasons
+                  : [`本地模型命中 · ${CATEGORY_ZH[base.category]}`],
+              },
+              category: base.category,
+              tier: "confirmed",
+              source: "curated",
+              updatedAt: new Date().toISOString(),
+            },
+            "baseline",
+          );
           return;
         }
+
+        // 3.（已移除）远端公榜查询。
+        //    公榜里 27.7% 的条目由泛化词（"同城"/"vpn"/"主页"）单独命中
+        //    产生，是已确认的误杀来源；而且它把 senumy_ipa 这类正常账号
+        //    标成了 human 层（最高信任档），扩展会照单执行。既然判定已经
+        //    由本地 baseline + 大模型接管，就没有理由再让一份我们既不控制
+        //    也审不了的名单替用户做不可逆的动作。
 
         // 4. v0.4-era persistent cache, read-only since v0.5 (spam reused
         //    as-is; legit/uncertain only if signals unchanged so new evidence
@@ -845,44 +1101,54 @@ export default defineContentScript({
           }
         }
 
-        // 4.5 Maintainer-curated keyword rules, shipped with the synced list.
-        // Catches first-seen template accounts (brand-new porn-bot throwaways
-        // not yet on the public list) with zero upload. Whitelist already won
-        // at step 2.
-        const ruleHit = matchLocalRules(sig);
-        if (ruleHit) {
-          renderLocalIndex(
-            anchor,
-            key,
-            sig,
-            {
-              userId: sig.userId ?? "",
-              handle: sig.handle,
-              verdict: {
-                label: ruleHit.label,
-                // The matched pattern never surfaces in the UI: spammers read
-                // their own block screenshots, and a leaked keyword is a
-                // free evasion recipe. Category only.
-                confidence: 0.95,
-                reasons: [`命中官方规则 · ${CATEGORY_ZH[ruleHit.category]}`],
-              },
-              category: ruleHit.category,
-              tier: "auto", // rule hits are auto tier — reply-scope gated
-              source: "community",
-              updatedAt: new Date().toISOString(),
-            },
-            "rule",
-            ctx,
-          );
+        // 4.5（已移除）随公榜下发的官方关键词规则。它们和公榜同源，
+        //     "同城" / "vpn" / "主页" / "应该没人" 这些正是误杀来源。
+        //     本地 baseline 的短语表取而代之，且每条都要签字。
+
+        // 5. baseline 中间带 → 大模型兜底。
+        //    刻意排在公榜 / 缓存 / 规则之后：那三条都能免费给出答案，已知
+        //    账号绝不该烧一次调用。走到这里的才是真正的「不认识且有信号」。
+        if (base.decision === "llm") {
+          await classifyLlm(anchor, key, sig, base, ctx);
           return;
         }
 
-        // 5. Local public list did not match. Just show neutral/unhit state.
+        // 6. 三条路径都没命中，baseline 也不表态 → 中性状态，不做任何判断。
         badgeFor(anchor, key, sig, null);
       } finally {
         inFlight.delete(key);
       }
     }
+
+    // ── 撤销通道 ──────────────────────────────────────────────────────
+    // 设置页跑在扩展自己的上下文里，拿不到 x.com 的 ct0 cookie，所以无法
+    // 直接调 X 的接口。它把撤销请求发到这里，由内容脚本用页面登录态执行。
+    // 这条通道只做「解除」，不做「施加」—— 一个只能撤销的入口不需要额外
+    // 的防误用考量。
+    chrome.runtime.onMessage.addListener(
+      (
+        msg: { type?: string; kind?: string; userId?: string; handle?: string },
+        _sender,
+        sendResponse: (r: { ok: boolean; error?: string }) => void,
+      ) => {
+        // 必须显式返回 false：返回 true 表示「稍后会异步回复」，而这个
+        // 监听器只处理 mxga-undo-x，其余消息若让通道悬着，Chrome 会抛
+        // "message channel closed before a response was received"。
+        if (msg?.type !== "mxga-undo-x") return false;
+        void (async () => {
+          try {
+            const kind = msg.kind === "mute" ? "unmute" : "unblock";
+            const { performXAction } = await import("../lib/x-action");
+            const attempt = await performXAction(kind, msg.userId, msg.handle);
+            // 404 = 本来就没拉黑/静音，对「撤销」而言等同成功。
+            sendResponse({ ok: attempt.ok || attempt.status === 404 });
+          } catch (e) {
+            sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) });
+          }
+        })();
+        return true; // async
+      },
+    );
 
     // Persist the logged-in viewer's own handle for the options page's
     // whitelist self-service flow (apply for YOUR account only).
@@ -926,9 +1192,7 @@ export default defineContentScript({
       // context where auto actions are allowed by default. Everything else
       // (home/list/search feeds, the focal tweet itself) is "feed".
       const focal = focalStatusId();
-      for (const art of document.querySelectorAll<HTMLElement>(
-        'article[data-testid="tweet"]',
-      )) {
+      for (const art of document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]')) {
         const handle = handleFromArticle(art);
         const nameBlock = art.querySelector<HTMLElement>('[data-testid="User-Name"]');
         if (!handle || !nameBlock) continue;
@@ -953,68 +1217,70 @@ export default defineContentScript({
         const st = document.createElement("style");
         st.textContent = STYLE;
         container.appendChild(st);
-        const bubble = createBubble({
-          onProcess(keys: string[], onProgress: (key: string, ok: boolean) => void) {
-            // Batch panel: the user explicitly confirmed, so act immediately
-            // (no 5s undo window). Sequential await keeps the native X
-            // mute/block calls on x-action's global pacing; the bubble's
-            // chips/progress/rows advance on every onProgress callback.
-            void (async () => {
-              for (const key of keys) {
-                const f = findings.find(
-                  (x) => (x.userId || `h:${x.handle}`) === key,
-                );
-                if (!f) {
-                  onProgress(key, false);
-                  continue;
+        const bubble = createBubble(
+          {
+            onProcess(keys: string[], onProgress: (key: string, ok: boolean) => void) {
+              // Batch panel: the user explicitly confirmed, so act immediately
+              // (no 5s undo window). Sequential await keeps the native X
+              // mute/block calls on x-action's global pacing; the bubble's
+              // chips/progress/rows advance on every onProgress callback.
+              void (async () => {
+                for (const key of keys) {
+                  const f = findings.find((x) => (x.userId || `h:${x.handle}`) === key);
+                  if (!f) {
+                    onProgress(key, false);
+                    continue;
+                  }
+                  const sig: Signals = {
+                    isProfile: false,
+                    handle: f.handle,
+                    displayName: f.displayName ?? "",
+                    bio: "",
+                    hasDefaultAvatar: false,
+                    recentTweets: [],
+                    ...(f.userId ? { userId: f.userId } : {}),
+                    ...(f.avatarUrl ? { avatarUrl: f.avatarUrl } : {}),
+                  };
+                  // Take over any pending 5s-undo for this account — the batch
+                  // action supersedes the preview window.
+                  const pending = pendingActions.get(key);
+                  if (pending) {
+                    clearTimeout(pending.timer);
+                    pendingActions.delete(key);
+                  }
+                  const ok = await executeHide(key, sig).catch(() => false);
+                  onProgress(key, ok);
                 }
-                const sig: Signals = {
-                  isProfile: false,
-                  handle: f.handle,
-                  displayName: f.displayName ?? "",
-                  bio: "",
-                  hasDefaultAvatar: false,
-                  recentTweets: [],
-                  ...(f.userId ? { userId: f.userId } : {}),
-                  ...(f.avatarUrl ? { avatarUrl: f.avatarUrl } : {}),
-                };
-                // Take over any pending 5s-undo for this account — the batch
-                // action supersedes the preview window.
-                const pending = pendingActions.get(key);
-                if (pending) {
-                  clearTimeout(pending.timer);
-                  pendingActions.delete(key);
-                }
-                const ok = await executeHide(key, sig).catch(() => false);
-                onProgress(key, ok);
+              })();
+            },
+            onReviewEach() {
+              const first = findings[0];
+              if (first) {
+                anchorByKey
+                  .get(first.userId || `h:${first.handle}`)
+                  ?.scrollIntoView({ behavior: "smooth", block: "center" });
               }
-            })();
+            },
+            onDismiss() {
+              dismissed = true;
+            },
+            onAppeal(appeal) {
+              openAppeal(appeal);
+            },
+            onToggleAuto(v: boolean) {
+              // Persist; the onSettingsChange listener updates `settings` (and
+              // echoes the new state back into the bubble, a no-op here).
+              void setSetting("autoProcess", v);
+            },
           },
-          onReviewEach() {
-            const first = findings[0];
-            if (first) {
-              anchorByKey
-                .get(first.userId || `h:${first.handle}`)
-                ?.scrollIntoView({ behavior: "smooth", block: "center" });
-            }
+          settings.bubblePos,
+          actionVerb(settings.actionMode),
+          {
+            autoProcess: settings.autoProcess,
+            autoCategoryCount: autoCategoryCount(settings),
+            autoExpand: settings.autoExpand,
           },
-          onDismiss() {
-            dismissed = true;
-          },
-          onAppeal(appeal) {
-            openAppeal(appeal);
-          },
-          onToggleAuto(v: boolean) {
-            // Persist; the onSettingsChange listener updates `settings` (and
-            // echoes the new state back into the bubble, a no-op here).
-            void setSetting("autoProcess", v);
-          },
-        }, settings.bubblePos, actionVerb(settings.actionMode), {
-          autoProcess: settings.autoProcess,
-          autoCategoryCount: autoCategoryCount(settings),
-          autoScopeAll: settings.autoScope === "all",
-          autoExpand: settings.autoExpand,
-        });
+        );
         container.appendChild(bubble.el);
         if (!settings.bubble) bubble.el.style.display = "none";
         bubbleApi = bubble;

@@ -11,7 +11,7 @@
 //
 // Recovered and generalized from the pre-v0.5.0 block implementation.
 
-export type XActionKind = "mute" | "block";
+export type XActionKind = "mute" | "block" | "unblock" | "unmute";
 
 export interface XActionAttempt {
   ok: boolean;
@@ -24,9 +24,13 @@ export interface XActionAttempt {
 const FALLBACK_X_BEARER =
   "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 
+// 撤销动作和执行动作走同一套端点族、同一条限流队列 —— 一次误判清理可能
+// 要解除几十个账号，节奏控制同样必要。
 const ENDPOINT: Record<XActionKind, string> = {
   block: "/i/api/1.1/blocks/create.json",
   mute: "/i/api/1.1/mutes/users/create.json",
+  unblock: "/i/api/1.1/blocks/destroy.json",
+  unmute: "/i/api/1.1/mutes/users/destroy.json",
 };
 
 // Pacing — shared across both action kinds (both are write actions against
@@ -38,6 +42,11 @@ const SHORT_COOLDOWN_MS = 8_000;
 const LONG_COOLDOWN_EVERY = 120;
 const LONG_COOLDOWN_MS = 60_000;
 const RATE_LIMIT_COOLDOWN_MS = 45_000;
+// 冷却时间上限。X 的 retry-after 是它说了算的，原来直接采信：回一个
+// 86400 就是静默停 24 小时，而且全程没有任何提示 —— 表现就是「一直卡在
+// 拉黑中」，无从判断是死了还是在等。宁可早重试一次撞上 429（那只是再等
+// 一轮），也不能让队列被一个外部数字无限期楔死。
+const MAX_COOLDOWN_MS = 5 * 60_000;
 const TRANSIENT_COOLDOWN_MS = 8_000;
 const LS_LAST_ACTION = "mxga:last-x-action";
 const LS_ACTION_ROUND = "mxga:x-action-round";
@@ -61,9 +70,7 @@ function ct0() {
 }
 
 function apiOrigin() {
-  return location.hostname.endsWith("twitter.com")
-    ? "https://twitter.com"
-    : "https://x.com";
+  return location.hostname.endsWith("twitter.com") ? "https://twitter.com" : "https://x.com";
 }
 
 function normalizeHandle(handle?: string) {
@@ -90,9 +97,7 @@ function setStorageNumber(key: string, value: number) {
 
 function readRound(): ActionRound {
   try {
-    const raw = JSON.parse(
-      localStorage.getItem(LS_ACTION_ROUND) || "{}",
-    ) as Partial<ActionRound>;
+    const raw = JSON.parse(localStorage.getItem(LS_ACTION_ROUND) || "{}") as Partial<ActionRound>;
     return {
       count: Math.max(0, Number(raw.count || 0) || 0),
       cooldownUntil: Math.max(0, Number(raw.cooldownUntil || 0) || 0),
@@ -132,10 +137,16 @@ function parseRetryAfterMs(value: string | null) {
 
 function recordBackoff(ms: number) {
   if (ms <= 0) return;
+  const capped = Math.min(ms, MAX_COOLDOWN_MS);
+  if (capped < ms) {
+    console.warn(
+      `[MXGA] X 要求冷却 ${Math.round(ms / 1000)}s，已截断到 ${Math.round(capped / 1000)}s`,
+    );
+  }
   const round = readRound();
   writeRound({
     ...round,
-    cooldownUntil: Math.max(round.cooldownUntil, Date.now() + ms),
+    cooldownUntil: Math.max(round.cooldownUntil, Date.now() + capped),
   });
 }
 
@@ -158,10 +169,19 @@ function recordSuccess() {
 }
 
 async function waitForSlot() {
+  let announced = false;
   while (true) {
     const round = readRound();
     const cooldownRemaining = round.cooldownUntil - Date.now();
     if (cooldownRemaining > 0) {
+      // 等待必须可见。原来这里是完全静默的循环，用户看到的只有一个永远
+      // 转不完的「拉黑中」，分不清是卡死还是在按节奏排队。
+      if (!announced && cooldownRemaining > 2000) {
+        announced = true;
+        console.info(
+          `[MXGA] X 动作冷却中，还需 ${Math.round(cooldownRemaining / 1000)}s（限速保护，队列会自动继续）`,
+        );
+      }
       await sleep(Math.min(1000, cooldownRemaining));
       continue;
     }
@@ -215,8 +235,7 @@ async function rawAction(
       ok: res.ok,
       status,
       retryAfterMs: parseRetryAfterMs(res.headers.get("retry-after")),
-      retryable:
-        status === 408 || status === 425 || status === 429 || status >= 500,
+      retryable: status === 408 || status === 425 || status === 429 || status >= 500,
     };
   } catch {
     return { ok: false, retryable: true };
@@ -230,10 +249,17 @@ export async function performXAction(
   handle?: string,
 ): Promise<XActionAttempt> {
   return withLock(async () => {
+    const t0 = Date.now();
     await waitForSlot();
+    const waited = Date.now() - t0;
     const attempt = await rawAction(kind, userId, handle);
     if (attempt.ok) recordSuccess();
     else recordFailure(attempt);
+    // 每次动作都留痕：排队多久、X 回了什么。没有这行就无法区分
+    // 「限速排队」「被 X 拒绝」「cookie 失效」这三种完全不同的失败。
+    console.info(
+      `[MXGA] X ${kind} @${handle ?? userId} → ${attempt.ok ? "成功" : `失败 status=${attempt.status ?? "网络错误"}`}${waited > 500 ? ` （排队 ${Math.round(waited / 1000)}s）` : ""}`,
+    );
     return attempt;
   });
 }

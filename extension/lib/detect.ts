@@ -21,9 +21,23 @@ export interface KnownUser {
 }
 
 const NON_PROFILE = new Set([
-  "home", "explore", "notifications", "messages", "i", "search", "settings",
-  "compose", "hashtag", "bookmarks", "lists", "communities", "jobs", "tos",
-  "privacy", "login", "signup",
+  "home",
+  "explore",
+  "notifications",
+  "messages",
+  "i",
+  "search",
+  "settings",
+  "compose",
+  "hashtag",
+  "bookmarks",
+  "lists",
+  "communities",
+  "jobs",
+  "tos",
+  "privacy",
+  "login",
+  "signup",
 ]);
 const TWITTER_SNOWFLAKE_EPOCH_MS = 1_288_834_974_657n;
 const UID_CREATED_AT_TOLERANCE_MS = 2 * 86_400_000;
@@ -46,8 +60,7 @@ export function parseCount(text: string | null | undefined): number | undefined 
   if (!text) return undefined;
   const m = text.replace(/[, ]/g, "").match(/([\d.]+)\s*([万KkMm千]?)/);
   if (!m || m[1] === undefined) return undefined;
-  const mult: Record<string, number> =
-    { 万: 1e4, 千: 1e3, K: 1e3, k: 1e3, M: 1e6, m: 1e6 };
+  const mult: Record<string, number> = { 万: 1e4, 千: 1e3, K: 1e3, k: 1e3, M: 1e6, m: 1e6 };
   return Math.round(Number.parseFloat(m[1]) * (mult[m[2] ?? ""] ?? 1));
 }
 
@@ -74,9 +87,10 @@ function trueFlag(v: unknown): true | undefined {
 }
 
 function bannerUserId(scope: Element | Document): string | undefined {
-  const el = scope.querySelector<HTMLElement>('[src*="profile_banners/"], [style*="profile_banners/"]');
-  const raw =
-    el instanceof HTMLImageElement ? el.src : (el?.getAttribute("style") ?? "");
+  const el = scope.querySelector<HTMLElement>(
+    '[src*="profile_banners/"], [style*="profile_banners/"]',
+  );
+  const raw = el instanceof HTMLImageElement ? el.src : (el?.getAttribute("style") ?? "");
   return numericId(raw.match(/profile_banners\/(\d+)\//)?.[1]);
 }
 
@@ -110,9 +124,7 @@ function profileJsonLdUserId(expectedHandle?: string): string | undefined {
         const handle =
           normalizeHandle(typeof e.additionalName === "string" ? e.additionalName : undefined) ??
           normalizeHandle(
-            typeof e.url === "string"
-              ? e.url.match(/\/([^/?#]+)(?:[?#].*)?$/)?.[1]
-              : undefined,
+            typeof e.url === "string" ? e.url.match(/\/([^/?#]+)(?:[?#].*)?$/)?.[1] : undefined,
           );
         if (expectedHandle && handle !== expectedHandle) continue;
 
@@ -166,10 +178,10 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function actionUserInfo(scope: Element | Document, handle?: string): Pick<
-  FiberUser,
-  "userId" | "viewerFollowing"
-> {
+function actionUserInfo(
+  scope: Element | Document,
+  handle?: string,
+): Pick<FiberUser, "userId" | "viewerFollowing"> {
   const expected = normalizeHandle(handle);
   const mention = expected ? new RegExp(`@${escapeRegExp(expected)}\\b`, "i") : undefined;
   for (const el of scope.querySelectorAll<HTMLElement>(
@@ -231,9 +243,7 @@ function readFiberUserUncached(el: Element, expectedHandle?: string): FiberUser 
         const u = findUser(bag, seen, 0, budget, expectedHandle);
         if (u) {
           const legacy = u.legacy ?? u;
-          const created = legacy.created_at
-            ? Date.parse(legacy.created_at)
-            : NaN;
+          const created = legacy.created_at ? Date.parse(legacy.created_at) : Number.NaN;
           const userId = fiberUserId(u, legacy);
           const accountAgeDays = Number.isNaN(created)
             ? undefined
@@ -282,7 +292,8 @@ function fiberUserId(u: any, legacy: any): string | undefined {
     String(legacy?.profile_image_url_https ?? "").match(/profile_images\/(\d+)\//)?.[1],
   );
   const candidateTime = candidate ? snowflakeTimeMs(candidate) : undefined;
-  const created = typeof legacy?.created_at === "string" ? Date.parse(legacy.created_at) : NaN;
+  const created =
+    typeof legacy?.created_at === "string" ? Date.parse(legacy.created_at) : Number.NaN;
   if (
     candidate &&
     avatarId === candidate &&
@@ -341,7 +352,10 @@ export function extractProfile(): Signals | null {
   const nameEl = document.querySelector<HTMLElement>('[data-testid="UserName"]');
   if (!nameEl) return null;
 
-  const lines = nameEl.innerText.split("\n").map((s) => s.trim()).filter(Boolean);
+  const lines = nameEl.innerText
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
   const handle = (lines.find((s) => s.startsWith("@")) ?? `@${seg[0]}`).slice(1);
   const displayName = lines[0] && !lines[0].startsWith("@") ? lines[0] : "";
   const bioEl = document.querySelector<HTMLElement>('[data-testid="UserDescription"]');
@@ -357,8 +371,7 @@ export function extractProfile(): Signals | null {
     if (/\/following$/.test(href)) following = val;
     else if (/(verified_)?followers$/.test(href)) followers = val;
   }
-  const scope =
-    document.querySelector('[data-testid="primaryColumn"]') ?? document;
+  const scope = document.querySelector('[data-testid="primaryColumn"]') ?? document;
   const { hasDefaultAvatar, avatarUrl } = avatarInfo(scope);
   const profileScope = scope instanceof Element ? scope : nameEl;
   const actionUser = actionUserInfo(profileScope, handle);
@@ -443,7 +456,10 @@ export function extractFromArticle(article: HTMLElement): Signals | null {
     const s = (a.getAttribute("href") ?? "").split("/").filter(Boolean);
     if (s.length === 1 && /^[A-Za-z0-9_]{1,15}$/.test(s[0] ?? "")) handle = s[0];
   }
-  const txt = nameBlock.innerText.split("\n").map((s) => s.trim()).filter(Boolean);
+  const txt = nameBlock.innerText
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
   if (txt.length) displayName = txt[0] ?? "";
   if (!handle) {
     const at = txt.find((s) => s.startsWith("@"));
@@ -457,9 +473,7 @@ export function extractFromArticle(article: HTMLElement): Signals | null {
   const actionUser = actionUserInfo(article, handle);
   const fu: KnownUser = {
     ...fiberUser,
-    ...(!fiberUser.userId && actionUser.userId
-      ? { userId: actionUser.userId }
-      : {}),
+    ...(!fiberUser.userId && actionUser.userId ? { userId: actionUser.userId } : {}),
     ...(actionUser.viewerFollowing ? { viewerFollowing: true as const } : {}),
     ...(isViewerHandle(handle) ? { viewerIsSelf: true as const } : {}),
   };

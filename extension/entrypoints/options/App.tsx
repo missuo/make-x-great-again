@@ -1,17 +1,42 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { ConsolidateProposal } from "../../../src/baseline/distill.ts";
+import {
+  type LearnedField,
+  type LearnedRule,
+  type LearnedStatus,
+  PROMOTE_MIN_ACCOUNTS,
+  type TemplateThresholds,
+  describeRule,
+} from "../../../src/baseline/learned.ts";
 import { clearGh, getGhLogin, getGhToken, ghUser, setGh } from "../../lib/auth";
 import { BRAND } from "../../lib/brand";
 import { CATEGORY_ZH, SPAM_CATEGORIES, type SpamCategory } from "../../lib/category";
+import {
+  type DistillLogEntry,
+  type DistillStatus,
+  type LearnedStats,
+  addManual,
+  clearDistillLog,
+  exportRules,
+  getDistillLog,
+  getRules,
+  getThresholds,
+  importRules,
+  learnedStats,
+  removeRule,
+  setStatus,
+  setThresholds,
+} from "../../lib/learned-store";
+import { getStoredList, getStoredWhitelist } from "../../lib/list-sync";
+import { type LlmConfig, getLlmConfig, setLlmConfig } from "../../lib/llm";
 import { categorizeReason, categorizeReasons } from "../../lib/reason-category";
 import {
   type ActionMode,
   type CategoryAction,
   type Settings,
   getSettings,
-  setCategoryAction,
   setSetting,
 } from "../../lib/settings";
-import { getStoredList, getStoredWhitelist } from "../../lib/list-sync";
 import {
   type BlockRecord,
   type CacheRow,
@@ -22,13 +47,115 @@ import {
   removeBlock,
   tweetUrl,
 } from "../../lib/store";
-import type { Label } from "../../lib/types";
+import { exportJsonl, recordRestoreAsNegative, sampleCounts } from "../../lib/training";
+import type { DryRunResult, Label } from "../../lib/types";
 
 const REPO = BRAND.repo;
 const EDGE_DEFAULT = BRAND.edgeBase;
 
 /** Pre-filled GitHub false-positive appeal for a listed account — matches the
  *  content-script's openAppeal so both entries land on the same filled form. */
+/**
+ * 解除 X 端的拉黑 / 静音。
+ *
+ * 设置页拿不到 x.com 的 ct0 cookie，所以动作必须由内容脚本用页面登录态
+ * 执行 —— 这里只负责把请求转给任意一个已打开的 x.com 标签页。没有开着的
+ * 标签页时如实告知，绝不假装成功：用户以为解除了、实际没解除，比报错更糟。
+ */
+async function undoXAction(r: { xAction?: "mute" | "block"; id: string; handle: string }): Promise<{
+  ok: boolean;
+  message?: string;
+}> {
+  if (!r.xAction) return { ok: true }; // 纯本地隐藏，X 端没有要撤销的东西
+  let tabs: chrome.tabs.Tab[] = [];
+  try {
+    tabs = await chrome.tabs.query({ url: ["*://x.com/*", "*://twitter.com/*"] });
+  } catch {
+    return { ok: false, message: "无法访问 X 标签页" };
+  }
+  const verb = r.xAction === "mute" ? "静音" : "拉黑";
+  if (!tabs.length) return { ok: false, message: `请先打开一个 X 页面，再恢复以解除${verb}` };
+  const userId = r.id.startsWith("h:") ? undefined : r.id;
+  for (const t of tabs) {
+    if (t.id === undefined) continue;
+    try {
+      const resp = await chrome.tabs.sendMessage(t.id, {
+        type: "mxga-undo-x",
+        kind: r.xAction,
+        userId,
+        handle: r.handle,
+      });
+      if (resp?.ok) return { ok: true };
+    } catch {
+      /* 这个标签页没有内容脚本 —— 试下一个 */
+    }
+  }
+  return { ok: false, message: `X 端${verb}解除失败，请到 X 手动解除` };
+}
+
+/**
+ * 人工标注样本的导出入口。
+ *
+ * 这些样本是模型往前走的唯一燃料：手动处理 = 人已确认的正样本，
+ * 「恢复显示」= 人已确认的负样本。负样本尤其关键 —— 没有它，baseline
+ * 就只能做模板匹配，永远训不出真正的判别式分类器。
+ */
+const TrainingExport = () => {
+  const [n, setN] = useState<{ spam: number; legit: number } | null>(null);
+  useEffect(() => {
+    void sampleCounts().then(setN);
+  }, []);
+  if (!n) return null;
+  const total = n.spam + n.legit;
+  return (
+    <div className="flex items-center gap-2 text-[12px] text-fg-3">
+      <span title="手动处理记为正样本；「恢复显示」记为负样本，用于纠正模型">
+        训练样本 {total} 条（正 {n.spam} / 负 {n.legit}）
+      </span>
+      <Btn
+        size="sm"
+        disabled={total === 0}
+        onClick={async () => {
+          const jsonl = await exportJsonl();
+          const url = URL.createObjectURL(new Blob([jsonl], { type: "application/x-ndjson" }));
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `mxga-training-${new Date().toISOString().slice(0, 10)}.jsonl`;
+          a.click();
+          URL.revokeObjectURL(url);
+        }}
+      >
+        导出训练样本
+      </Btn>
+    </div>
+  );
+};
+
+/**
+ * 一次「恢复显示」→ 回扫全部学习规则，退役一切会打中这个账号的。
+ *
+ * 这是自学习闭环里价值最高的一步：用户纠错一次，拔掉的不是这一个账号的
+ * 处理结果，而是**所有**会犯同类错的规则。没有它，同一条过泛规则会在
+ * 不同账号上一遍遍重犯，用户只能一遍遍手动恢复。
+ */
+async function retireOnRestore(r: {
+  displayName?: string;
+  tweetText?: string;
+}): Promise<void> {
+  try {
+    const { retireByNegative } = await import("../../lib/learned-store");
+    const retired = await retireByNegative({
+      ...(r.displayName ? { displayName: r.displayName } : {}),
+      ...(r.tweetText ? { recentTweets: [r.tweetText] } : {}),
+    });
+    if (retired.length) {
+      console.info(`[MXGA] 已退役 ${retired.length} 条会打中该账号的学习规则`);
+    }
+  } catch {
+    /* 非致命 —— 恢复动作本身已经完成 */
+  }
+}
+
 function appealUrl(handle: string, userId?: string): string {
   const p = new URLSearchParams();
   p.set("handle", `@${handle}`);
@@ -70,9 +197,7 @@ const Tag = ({ label, conf }: { label: Label; conf?: number }) => {
     >
       {zh}
       {conf !== undefined ? (
-        <span className="font-mono text-[10.5px] opacity-80">
-          {(conf * 100).toFixed(0)}%
-        </span>
+        <span className="font-mono text-[10.5px] opacity-80">{(conf * 100).toFixed(0)}%</span>
       ) : null}
     </span>
   );
@@ -193,7 +318,7 @@ const AvatarLink = ({ handle, url, name }: { handle: string; url?: string; name?
   <a
     href={`https://x.com/${encodeURIComponent(handle)}`}
     target="_blank"
-    rel="noopener"
+    rel="noreferrer noopener"
     className="flex-none rounded-full ring-offset-1 transition hover:ring-2 hover:ring-accent/50"
     title={`去 @${handle} 的 X 主页`}
   >
@@ -206,7 +331,7 @@ const HandleLink = ({ handle, className = "" }: { handle: string; className?: st
   <a
     href={`https://x.com/${encodeURIComponent(handle)}`}
     target="_blank"
-    rel="noopener"
+    rel="noreferrer noopener"
     className={`transition hover:text-accent ${className}`}
     title={`去 @${handle} 的 X 主页`}
   >
@@ -267,7 +392,8 @@ function Btn({
         : tier === "ghost"
           ? "border-transparent bg-transparent text-fg-2 hover:bg-card-hi hover:text-fg"
           : "border-border-2 bg-transparent text-fg hover:bg-card-hi hover:border-fg-3";
-  const px = size === "sm" ? "px-2.5 py-1 text-[12px] rounded-sm" : "px-3 py-1.5 text-[13px] rounded-md";
+  const px =
+    size === "sm" ? "px-2.5 py-1 text-[12px] rounded-sm" : "px-3 py-1.5 text-[13px] rounded-md";
   return (
     <button
       type="button"
@@ -363,7 +489,7 @@ function ListStatusCard({ ls, onRefreshed }: { ls: ListState; onRefreshed: () =>
       };
       const d = r?.data;
       if (r?.ok && d && !d.error) {
-        setMsg(d.updated ? `已更新 · 黑名单 ${d.black?.toLocaleString()} 条` : "已是最新版本");
+        setMsg(d.updated ? `已更新 · 白名单 ${d.white?.toLocaleString()} 条` : "已是最新版本");
         onRefreshed();
       } else {
         setMsg(`更新失败：${d?.error ?? r?.error ?? "未知错误"}`);
@@ -377,17 +503,11 @@ function ListStatusCard({ ls, onRefreshed }: { ls: ListState; onRefreshed: () =>
   return (
     <div className="list-status-card mb-8 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-4 py-3">
       <div className="list-status-summary flex flex-wrap items-baseline gap-x-5 gap-y-1 text-[13px]">
-        <span className="list-status-stat">
-          <b className="font-mono text-[16px] tabular-nums">{ls.black.toLocaleString("zh-CN")}</b>
-          <span className="ml-1 text-fg-3">黑名单</span>
-        </span>
+        {/* 只剩白名单一项。公榜与官方规则两条来源已移除，那两个计数永远
+            是 0，摆在概览最上面读起来像「同步坏了」。 */}
         <span className="list-status-stat">
           <b className="font-mono text-[16px] tabular-nums">{ls.white.toLocaleString("zh-CN")}</b>
-          <span className="ml-1 text-fg-3">白名单</span>
-        </span>
-        <span className="list-status-stat">
-          <b className="font-mono text-[16px] tabular-nums">{ls.rules}</b>
-          <span className="ml-1 text-fg-3">检测规则</span>
+          <span className="ml-1 text-fg-3">白名单账号 · 永不处理</span>
         </span>
         <span className="list-status-meta text-[12px] text-fg-3">
           上次同步 {relTime(ls.fetchedAt)}
@@ -410,9 +530,11 @@ function Overview() {
   const [autoBl, setAutoBl] = useState(0);
   const [ls, setLs] = useState<ListState | null>(null);
   const [st, setSt] = useState<Settings | null>(null);
+  const [learned, setLearned] = useState<LearnedStats | null>(null);
   const loadLists = () => readListState().then(setLs);
   useEffect(() => {
     getStats().then(setS);
+    void learnedStats().then(setLearned);
     getBlocklist().then((l) => {
       setBl(l.length);
       setAutoBl(l.filter((r) => r.source === "auto").length);
@@ -455,9 +577,31 @@ function Overview() {
       <div className="overview-stats mb-8 grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-border bg-border lg:grid-cols-4">
         <Card n={s.detections} l="AI 检测总数" />
         <Card n={s.cacheHits} l="缓存命中 · 省下的 AI 判定" />
-        <Card n={bl} l={autoBl ? `已处理账号 · 其中自动 ${autoBl.toLocaleString("zh-CN")}` : "已处理账号"} />
+        <Card
+          n={bl}
+          l={autoBl ? `已处理账号 · 其中自动 ${autoBl.toLocaleString("zh-CN")}` : "已处理账号"}
+        />
         <Card n={(d.spam ?? 0) + (d.porn_bot ?? 0)} l="判定为垃圾/色情bot" />
       </div>
+
+      {learned && learned.trusted + learned.candidate + learned.retired > 0 && (
+        <div className="mb-8">
+          <SectionH>模型学习</SectionH>
+          <p className="mt-2 text-[13px] leading-relaxed text-fg-2">
+            已学到 <b className="text-fg">{learned.trusted}</b> 条可信规则（命中即自动处理）、
+            <b className="text-fg">{learned.candidate}</b> 条候选规则（命中只送 AI 复核）。
+            {learned.retired > 0 && (
+              <>
+                {" "}
+                另有 <b className="text-fg">{learned.retired}</b> 条因误伤过正常账号已停用。
+              </>
+            )}{" "}
+            <a href="#learning" className="underline">
+              查看与管理
+            </a>
+          </p>
+        </div>
+      )}
 
       {ls && ls.black > 0 && (
         <div className="mb-8">
@@ -496,24 +640,22 @@ function Overview() {
               调整 →
             </a>
           </div>
-          <div className="mt-2 flex flex-wrap gap-2">
-            {SPAM_CATEGORIES.map((cat) => {
-              const act = st.categoryActions[cat] ?? "badge";
-              const actZh =
-                act === "badge" ? "仅标记" : act === "hide" ? "本地隐藏" : act === "mute" ? "X 静音" : "X 拉黑";
-              return (
-                <span
-                  key={cat}
-                  className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[12px] ${
-                    act === "badge" ? "border-border-2 text-fg-3" : "border-fg/30 text-fg"
-                  }`}
-                >
-                  <i className="block h-2 w-2 rounded-full" style={{ background: CAT_COLOR[cat] }} />
-                  {CATEGORY_ZH[cat]} · {actZh}
-                </span>
-              );
-            })}
-          </div>
+          <p className="mt-2 text-[13px] text-fg-2">
+            本地模型或 AI 判定为垃圾账号时 ——{" "}
+            <b className="text-fg">
+              {(() => {
+                const act = st.categoryActions.porn ?? "badge";
+                return act === "badge"
+                  ? "仅标记"
+                  : act === "hide"
+                    ? "本地隐藏"
+                    : act === "mute"
+                      ? "X 静音"
+                      : "X 拉黑";
+              })()}
+            </b>
+            {st.autoProcess ? "" : "（自动处理已暂停，当前一律只标记）"}
+          </p>
         </div>
       )}
 
@@ -559,7 +701,9 @@ function Blocklist() {
   const rows = useMemo(
     () =>
       list.filter((r) =>
-        `${r.handle} ${r.displayName ?? ""} ${r.reason ?? ""}`.toLowerCase().includes(q.toLowerCase()),
+        `${r.handle} ${r.displayName ?? ""} ${r.reason ?? ""}`
+          .toLowerCase()
+          .includes(q.toLowerCase()),
       ),
     [list, q],
   );
@@ -569,7 +713,7 @@ function Blocklist() {
     manual: { label: "手动处理", hint: "你在页面上手动点了隐藏 / 静音 / 拉黑" },
     auto: {
       label: "自动处理",
-      hint: "命中公共黑名单或官方规则，按「设置 → 自动处理策略」自动执行",
+      hint: "本地模型或 AI 判定为垃圾账号，按「设置 → 自动处理策略」自动执行",
     },
     block_all: { label: "一键处理", hint: "在气泡面板一键处理了本页全部命中（旧版记录）" },
     list_hit: { label: "名单命中", hint: "命中公共黑名单（旧版记录）" },
@@ -578,15 +722,18 @@ function Blocklist() {
   return (
     <Page
       title="处理记录"
-      sub={`共 ${list.length} 条 · 记录所有被隐藏 / 静音 / 拉黑的账号 · 恢复显示用于纠正误判（本地恢复可见；X 端的静音 / 拉黑需去 X 手动解除）`}
+      sub={`共 ${list.length} 条 · 记录所有被隐藏 / 静音 / 拉黑的账号 · 恢复显示用于纠正误判（同时解除 X 端的静音 / 拉黑，需有一个 X 页面开着）`}
     >
-      <input
-        aria-label="搜索处理记录"
-        value={q}
-        onChange={(e) => setQ(e.target.value)}
-        placeholder="搜索 @handle / 显示名 / 理由"
-        className="mb-4 w-full max-w-[320px] rounded-md border border-border-2 bg-transparent px-3 py-2 text-[13px] outline-none transition focus:border-accent"
-      />
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <input
+          aria-label="搜索处理记录"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="搜索 @handle / 显示名 / 理由"
+          className="w-full max-w-[320px] rounded-md border border-border-2 bg-transparent px-3 py-2 text-[13px] outline-none transition focus:border-accent"
+        />
+        <TrainingExport />
+      </div>
       {/* overflow-x-auto（而非 hidden）：窄窗口下表格横向滚动，操作列不再被裁掉 */}
       <div className="desktop-record-table overflow-x-auto rounded-lg border border-border">
         <table className="w-full min-w-[880px] border-collapse text-[13px]">
@@ -616,7 +763,7 @@ function Blocklist() {
                           <a
                             href={`https://x.com/${encodeURIComponent(r.handle)}`}
                             target="_blank"
-                            rel="noopener"
+                            rel="noreferrer noopener"
                             className="text-fg transition hover:text-accent"
                             title={`去 @${r.handle} 的 X 主页`}
                           >
@@ -643,7 +790,7 @@ function Blocklist() {
                       <a
                         href={tweetUrl(r) as string}
                         target="_blank"
-                        rel="noopener"
+                        rel="noreferrer noopener"
                         title={r.tweetText ? `触发内容：${r.tweetText}` : "查看触发这次处理的推文"}
                         className="whitespace-nowrap text-[11px] text-fg-3 underline decoration-dotted underline-offset-2 transition hover:text-accent"
                       >
@@ -677,7 +824,13 @@ function Blocklist() {
                     <Btn
                       size="sm"
                       onClick={async () => {
+                        const undone = await undoXAction(r);
+                        // 「恢复显示」= 人工确认的误判。这是训练集里最稀缺
+                        // 的负样本，必须在删记录**之前**抓取。
+                        await recordRestoreAsNegative(r);
+                        await retireOnRestore(r);
                         await removeBlock(r.id);
+                        if (!undone.ok && undone.message) alert(undone.message);
                         load();
                       }}
                     >
@@ -686,7 +839,7 @@ function Blocklist() {
                     <a
                       href={appealUrl(r.handle, r.id)}
                       target="_blank"
-                      rel="noopener"
+                      rel="noreferrer noopener"
                       title="账号被误列？提交申诉（已预填账号信息）"
                       className="whitespace-nowrap text-[11px] text-fg-3 underline decoration-dotted underline-offset-2 transition hover:text-warn"
                     >
@@ -703,11 +856,7 @@ function Blocklist() {
         {rows.map((r) => (
           <article key={r.id} className="mobile-record-card">
             <header className="flex items-start gap-3">
-              <AvatarLink
-                handle={r.handle}
-                url={r.avatarUrl}
-                name={r.displayName || r.handle}
-              />
+              <AvatarLink handle={r.handle} url={r.avatarUrl} name={r.displayName || r.handle} />
               <div className="min-w-0 flex-1">
                 <div className="truncate font-semibold text-fg">
                   {r.displayName || `@${r.handle}`}
@@ -722,7 +871,7 @@ function Blocklist() {
                 <a
                   href={tweetUrl(r) as string}
                   target="_blank"
-                  rel="noopener"
+                  rel="noreferrer noopener"
                   className="text-[12px] text-fg-2 underline decoration-dotted underline-offset-2"
                 >
                   查看现场 ↗
@@ -741,7 +890,11 @@ function Blocklist() {
                   size="sm"
                   className="mobile-record-action"
                   onClick={async () => {
+                    const undone = await undoXAction(r);
+                    await recordRestoreAsNegative(r);
+                    await retireOnRestore(r);
                     await removeBlock(r.id);
+                    if (!undone.ok && undone.message) alert(undone.message);
                     load();
                   }}
                 >
@@ -750,7 +903,7 @@ function Blocklist() {
                 <a
                   href={appealUrl(r.handle, r.id)}
                   target="_blank"
-                  rel="noopener"
+                  rel="noreferrer noopener"
                   className="text-[11px] text-fg-3 underline decoration-dotted underline-offset-2"
                 >
                   误判申诉 ↗
@@ -800,7 +953,7 @@ function Cache() {
                           <a
                             href={`https://x.com/${encodeURIComponent(c.handle)}`}
                             target="_blank"
-                            rel="noopener"
+                            rel="noreferrer noopener"
                             className="text-fg transition hover:text-accent"
                             title={`去 @${c.handle} 的 X 主页`}
                           >
@@ -835,11 +988,7 @@ function Cache() {
         {rows.map((c) => (
           <article key={c.id} className="mobile-record-card">
             <header className="flex items-start gap-3">
-              <AvatarLink
-                handle={c.handle}
-                url={c.avatarUrl}
-                name={c.displayName || c.handle}
-              />
+              <AvatarLink handle={c.handle} url={c.avatarUrl} name={c.displayName || c.handle} />
               <div className="min-w-0 flex-1">
                 <div className="truncate font-semibold text-fg">
                   {c.displayName || `@${c.handle}`}
@@ -877,9 +1026,7 @@ function Toggle({
         aria-checked={on}
         onClick={() => onChange(!on)}
         className={`mt-0.5 h-5 w-9 flex-none rounded-full border transition ${
-          on
-            ? "bg-fg border-fg"
-            : "bg-card-hi border-border-2"
+          on ? "bg-fg border-fg" : "bg-card-hi border-border-2"
         }`}
       >
         <span
@@ -948,91 +1095,32 @@ async function ensureXPermission(): Promise<boolean> {
   }
 }
 
-const CATEGORY_HINT: Record<SpamCategory, string> = {
-  porn: "约炮 / 上门 / 引流到主页的色情机器人",
-  crypto: "荐币、空投、合约喊单、股票投放",
-  gambling: "博彩、体育投注、棋牌推广",
-  resource: "网盘资源自取、盗版资源引流",
-  marketing: "广告矩阵、涨粉、通用营销引流",
-  other: "已确认是垃圾号但未归入以上类别",
-};
-
 // Same action vocabulary as the manual 处理方式 selector — the four segments
 // describe WHAT happens; that this column happens automatically is carried by
 // the section title. 「自动隐藏/自动静音」-style labels made it look like a
 // different set of actions from the manual ones (they never were).
-const CATEGORY_ACTIONS: { value: CategoryAction; label: string; title: string; needsX: boolean }[] = [
-  { value: "badge", label: "仅标记", title: "只挂角标提示，不做任何处理", needsX: false },
-  { value: "hide", label: "本地隐藏", title: "只在本扩展里隐藏（仅本机、可随时恢复），与手动方式里的「本地隐藏」是同一动作", needsX: false },
-  { value: "mute", label: "X 静音", title: "X 原生静音：用你的登录态执行，所有设备生效；对方无感知", needsX: true },
-  { value: "block", label: "X 拉黑", title: "X 原生拉黑：用你的登录态执行，所有设备生效；互相不可见、解除关注，需谨慎", needsX: true },
-];
-
-/** cat → 1-char lite-artifact code (schema v2), for the per-category counts
- *  shown next to the policy rows. Mirrors CODE_TO_CATEGORY in lib/category. */
-const CAT_CODE: Record<SpamCategory, string> = {
-  porn: "p",
-  crypto: "c",
-  gambling: "g",
-  resource: "r",
-  marketing: "m",
-  other: "o",
-};
-
-/** One category row: name + hint on the left, 4-way segmented control on the
- *  right. mute/block request the optional x.com permission first, exactly
- *  like the manual 处理方式 selector. `count` = how many accounts of this
- *  category are in the locally-synced public blacklist (hidden when no list). */
-function CategoryPolicyRow({
-  cat,
-  value,
-  count,
-  onChange,
-}: {
-  cat: SpamCategory;
-  value: CategoryAction;
-  count?: number;
-  onChange: (a: CategoryAction) => void;
-}) {
-  return (
-    <div className="category-policy-row flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-lg border border-border-2 p-3">
-      <div className="min-w-0 flex-1 sm:min-w-[150px]">
-        <span className="font-medium text-fg">{CATEGORY_ZH[cat]}</span>
-        {count !== undefined && (
-          <span
-            className="ml-1.5 font-mono text-[12px] tabular-nums text-fg-3"
-            title={`本地公共名单中该类别共 ${count.toLocaleString("zh-CN")} 个账号`}
-          >
-            · {count.toLocaleString("zh-CN")}
-          </span>
-        )}
-        <span className="block text-[12px] text-fg-3">{CATEGORY_HINT[cat]}</span>
-      </div>
-      <div className="category-policy-actions flex w-full overflow-x-auto rounded-md border border-border-2 sm:w-auto">
-        {CATEGORY_ACTIONS.map((a) => {
-          const active = value === a.value;
-          return (
-            <button
-              key={a.value}
-              type="button"
-              title={a.title}
-              onClick={() => onChange(a.value)}
-              className={`px-2.5 py-1.5 text-[12px] transition ${
-                active
-                  ? a.value === "block"
-                    ? "bg-danger/15 font-semibold text-danger"
-                    : "bg-card-hi font-semibold text-fg"
-                  : "text-fg-3 hover:text-fg"
-              }`}
-            >
-              {a.label}
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
+const CATEGORY_ACTIONS: { value: CategoryAction; label: string; title: string; needsX: boolean }[] =
+  [
+    { value: "badge", label: "仅标记", title: "只挂角标提示，不做任何处理", needsX: false },
+    {
+      value: "hide",
+      label: "本地隐藏",
+      title: "只在本扩展里隐藏（仅本机、可随时恢复），与手动方式里的「本地隐藏」是同一动作",
+      needsX: false,
+    },
+    {
+      value: "mute",
+      label: "X 静音",
+      title: "X 原生静音：用你的登录态执行，所有设备生效；对方无感知",
+      needsX: true,
+    },
+    {
+      value: "block",
+      label: "X 拉黑",
+      title: "X 原生拉黑：用你的登录态执行，所有设备生效；互相不可见、解除关注，需谨慎",
+      needsX: true,
+    },
+  ];
 
 type ApplyStatus = "none" | "pending" | "approved" | "rejected";
 
@@ -1179,7 +1267,10 @@ function WhitelistApplySection({ edgeBase }: { edgeBase: string }) {
       }
       const granted = await chrome.permissions.request({ origins: ["https://github.com/*"] });
       if (!granted) {
-        setMsg({ text: "未授权访问 github.com——一键登录需要该权限（仅用于 GitHub 配对登录）。", ok: false });
+        setMsg({
+          text: "未授权访问 github.com——一键登录需要该权限（仅用于 GitHub 配对登录）。",
+          ok: false,
+        });
         return;
       }
     } catch {
@@ -1417,7 +1508,7 @@ function WhitelistApplySection({ edgeBase }: { edgeBase: string }) {
               <a
                 href={ghFlow.uri}
                 target="_blank"
-                rel="noopener"
+                rel="noreferrer noopener"
                 className="text-fg-2 underline hover:text-fg"
               >
                 手动打开 ↗
@@ -1471,7 +1562,11 @@ function WhitelistApplySection({ edgeBase }: { edgeBase: string }) {
         </div>
         <div className="flex items-center gap-3">
           <Btn tier="primary" onClick={apply} disabled={busy || !token.trim() || !ownHandle}>
-            {busy ? "提交中…" : status === "rejected" ? "重新提交申请" : "申请把我的 X 账号加入白名单"}
+            {busy
+              ? "提交中…"
+              : status === "rejected"
+                ? "重新提交申请"
+                : "申请把我的 X 账号加入白名单"}
           </Btn>
         </div>
         {msg && <p className={`text-[12px] ${msg.ok ? "text-ok" : "text-danger"}`}>{msg.text}</p>}
@@ -1484,13 +1579,9 @@ function Settings() {
   const [cleared, setCleared] = useState(false);
   const [clearOpen, setClearOpen] = useState(false);
   const [st, setSt] = useState<Settings | null>(null);
-  const [ls, setLs] = useState<ListState | null>(null);
   const [permDenied, setPermDenied] = useState(false);
   useEffect(() => {
     getSettings().then(setSt);
-    // Loaded once so each 分级策略 row can show how many synced public-list
-    // accounts fall into its category. No list yet → counts stay hidden.
-    readListState().then(setLs);
   }, []);
   const save = async <K extends keyof Settings>(k: K, v: Settings[K]) => {
     await setSetting(k, v);
@@ -1507,7 +1598,17 @@ function Settings() {
     setPermDenied(false);
     await save("actionMode", mode);
   };
-  const changeCategoryAction = async (cat: SpamCategory, action: CategoryAction) => {
+  // 分类别配置已收掉：六个类别各自一档在实际使用里从没被分开调过，只是
+  // 让设置页多了六行。数据结构保留（判定链仍按类别走），UI 收成一个统一
+  // 动作，一次写满六个类别。
+  const uniformAction: CategoryAction | null = st
+    ? (() => {
+        const vals = SPAM_CATEGORIES.map((c) => st.categoryActions[c] ?? "badge");
+        const first = vals[0];
+        return vals.every((v) => v === first) ? (first ?? null) : null;
+      })()
+    : null;
+  const changeAllCategories = async (action: CategoryAction) => {
     if (action === "mute" || action === "block") {
       const ok = await ensureXPermission();
       if (!ok) {
@@ -1516,10 +1617,11 @@ function Settings() {
       }
     }
     setPermDenied(false);
-    await setCategoryAction(cat, action);
-    setSt((p) =>
-      p ? { ...p, categoryActions: { ...p.categoryActions, [cat]: action } } : p,
-    );
+    const next = Object.fromEntries(
+      SPAM_CATEGORIES.map((c) => [c, action]),
+    ) as Settings["categoryActions"];
+    await setSetting("categoryActions", next);
+    setSt((p) => (p ? { ...p, categoryActions: next } : p));
   };
   return (
     <Page title="设置" sub="配置仅存于本机">
@@ -1554,8 +1656,8 @@ function Settings() {
           <section>
             <SectionH>自动处理策略</SectionH>
             <p className="mb-3 text-[12px] leading-relaxed text-fg-3">
-              命中<b className="text-fg-2">公共黑名单或官方规则</b>的账号按下方类别设定自动处理，其余只挂角标。
-              规则命中只在评论区自动执行；白名单账号永不处理；一切可在「处理记录」撤销。
+              被<b className="text-fg-2">本地模型</b>或<b className="text-fg-2">AI 判定</b>
+              认定为垃圾账号时自动执行下面的动作。 白名单账号永不处理；一切可在「处理记录」撤销。
             </p>
             <div className="mb-4">
               <Toggle
@@ -1565,114 +1667,37 @@ function Settings() {
                 hint="总开关，与气泡面板里的「自动处理」开关同步；关闭后以下配置保留但不执行，一切命中只标记"
               />
             </div>
-            <div className="mb-4">
-              <div className="mb-1.5 text-[12px] font-semibold text-fg">自动处理范围</div>
-              <div className="auto-scope-grid grid grid-cols-1 gap-2 sm:grid-cols-2">
-                {(
-                  [
-                    {
-                      v: "replies",
-                      label: "仅推文评论区（推荐）",
-                      hint: "只自动处理别人推文下的回复——垃圾潮所在；信息流和主页只标记。",
-                    },
-                    {
-                      v: "all",
-                      label: "全局",
-                      hint: "信息流、主页、评论区都自动处理，误伤风险更高。",
-                    },
-                  ] as const
-                ).map((o) => {
-                  const active = (st.autoScope ?? "replies") === o.v;
-                  return (
-                    <button
-                      key={o.v}
-                      type="button"
-                      onClick={() => save("autoScope", o.v)}
-                      className={`flex items-start gap-2.5 rounded-lg border p-3 text-left transition ${
-                        active ? "border-fg bg-card-hi" : "border-border-2 hover:border-fg-3"
-                      }`}
-                    >
-                      <span
-                        className={`mt-0.5 flex h-4 w-4 flex-none items-center justify-center rounded-full border ${
-                          active ? "border-fg" : "border-border-2"
-                        }`}
-                      >
-                        {active && <span className="h-2 w-2 rounded-full bg-fg" />}
-                      </span>
-                      <span>
-                        <span className="text-[13px] font-medium text-fg">{o.label}</span>
-                        <span className="block text-[12px] leading-5 text-fg-3">{o.hint}</span>
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-            <div className="mb-4">
-              <div className="mb-1.5 text-[12px] font-semibold text-fg">自动收录条目</div>
-              <p className="mb-2 text-[12px] leading-relaxed text-fg-3">
-                命中分两级：<b className="text-fg-2">人工确认</b>（维护者复核过的公榜条目，始终按下方各类别的动作完整执行）和
-                <b className="text-fg-2">自动收录</b>（AI/规则自动上榜的公榜条目 + 本地官方规则命中，占大多数）。这里决定自动收录一级能自动处理到什么程度。
-              </p>
-              <div className="grid grid-cols-1 gap-2">
-                {(
-                  [
-                    {
-                      v: "full",
-                      label: "完整执行（默认）",
-                      hint: "自动收录与人工确认同权，按各类别设定的动作执行（包括 X 静音/拉黑）。误判可在「处理记录」恢复并申诉。",
-                    },
-                    {
-                      v: "hide",
-                      label: "封顶为本地隐藏",
-                      hint: "按各类别设定的动作执行，但封顶为本地隐藏——零联网、一键恢复；X 静音/拉黑仍只对人工确认条目执行。",
-                    },
-                    {
-                      v: "badge",
-                      label: "仅标记",
-                      hint: "自动收录条目只挂角标、永不自动处理（最保守）。",
-                    },
-                  ] as const
-                ).map((o) => {
-                  const active = (st.autoTierMode ?? "full") === o.v;
-                  return (
-                    <button
-                      key={o.v}
-                      type="button"
-                      onClick={() => save("autoTierMode", o.v)}
-                      className={`flex items-start gap-2.5 rounded-lg border p-3 text-left transition ${
-                        active ? "border-fg bg-card-hi" : "border-border-2 hover:border-fg-3"
-                      }`}
-                    >
-                      <span
-                        className={`mt-0.5 flex h-4 w-4 flex-none items-center justify-center rounded-full border ${
-                          active ? "border-fg" : "border-border-2"
-                        }`}
-                      >
-                        {active && <span className="h-2 w-2 rounded-full bg-fg" />}
-                      </span>
-                      <span>
-                        <span className="text-[13px] font-medium text-fg">{o.label}</span>
-                        <span className="block text-[12px] leading-5 text-fg-3">{o.hint}</span>
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            <div className="mb-1.5 text-[12px] font-semibold text-fg">命中后的动作</div>
             <div className="space-y-2">
-              {SPAM_CATEGORIES.map((cat) => (
-                <CategoryPolicyRow
-                  key={cat}
-                  cat={cat}
-                  value={st.categoryActions[cat] ?? "badge"}
-                  count={ls && ls.black > 0 ? (ls.catDist[CAT_CODE[cat]] ?? 0) : undefined}
-                  onChange={(a) => changeCategoryAction(cat, a)}
-                />
-              ))}
+              {CATEGORY_ACTIONS.map((a) => {
+                const active = uniformAction === a.value;
+                return (
+                  <button
+                    key={a.value}
+                    type="button"
+                    onClick={() => changeAllCategories(a.value)}
+                    className={`flex w-full items-start gap-3 rounded-lg border p-3 text-left transition ${
+                      active ? "border-fg bg-card-hi" : "border-border-2 hover:border-fg-3"
+                    }`}
+                  >
+                    <span
+                      className={`mt-0.5 flex h-4 w-4 flex-none items-center justify-center rounded-full border ${
+                        active ? "border-fg" : "border-border-2"
+                      }`}
+                    >
+                      {active && <span className="h-2 w-2 rounded-full bg-fg" />}
+                    </span>
+                    <span>
+                      <span className="font-medium text-fg">{a.label}</span>
+                      <span className="block text-[12px] text-fg-3">{a.title}</span>
+                    </span>
+                  </button>
+                );
+              })}
             </div>
             <p className="mt-2 text-[12px] text-fg-3">
-              动作含义与下方「手动处理动作」一致：本地隐藏仅本机、可恢复；X 静音 / 拉黑用你的登录态原生执行，所有设备生效。
+              动作含义与下方「手动处理动作」一致：本地隐藏仅本机、可恢复；X 静音 /
+              拉黑用你的登录态原生执行，所有设备生效。
             </p>
             {import.meta.env.SAFARI && (
               <p className="mt-2 text-[12px] leading-relaxed text-fg-3">
@@ -1693,7 +1718,9 @@ function Settings() {
           <section>
             <SectionH>手动处理动作</SectionH>
             <p className="mb-3 text-[12px] text-fg-3">
-              只决定你<b className="text-fg-2">手动</b>点角标或气泡按钮时执行哪种动作，不影响上方的自动处理。X 静音 / 拉黑走你自己的登录态，不经过我们的服务器。
+              只决定你<b className="text-fg-2">手动</b>
+              点角标或气泡按钮时执行哪种动作，不影响上方的自动处理。X 静音 /
+              拉黑走你自己的登录态，不经过我们的服务器。
             </p>
             <div className="space-y-2">
               {ACTION_MODES.map((m) => {
@@ -1704,9 +1731,7 @@ function Settings() {
                     key={m.value}
                     onClick={() => changeMode(m.value)}
                     className={`flex w-full items-start gap-3 rounded-lg border p-3 text-left transition ${
-                      active
-                        ? "border-fg bg-card-hi"
-                        : "border-border-2 hover:border-fg-3"
+                      active ? "border-fg bg-card-hi" : "border-border-2 hover:border-fg-3"
                     }`}
                   >
                     <span
@@ -1776,7 +1801,10 @@ const About = () => (
   <Page title="关于" sub={`${BRAND.name} · 公益、开源`}>
     <div className="max-w-[680px] space-y-4 text-[13px] leading-7 text-fg-2">
       <p>
-        X(Twitter) 反垃圾 / 色情机器人扩展。被动检测：公共名单由扩展定期从官方源自动同步（只下载公开名单数据，不上传任何内容），比对全部在本机完成。如在「设置」里把手动或自动动作选为 X 静音 / 拉黑，则会用你当前的 X 登录态调用 X 自家接口对账号生效（仍不经过我们的服务器、不收集任何数据）。
+        X(Twitter) 反垃圾 /
+        色情机器人扩展。被动检测：公共名单由扩展定期从官方源自动同步（只下载公开名单数据，不上传任何内容），比对全部在本机完成。如在「设置」里把手动或自动动作选为
+        X 静音 / 拉黑，则会用你当前的 X 登录态调用 X
+        自家接口对账号生效（仍不经过我们的服务器、不收集任何数据）。
       </p>
       <div className="about-grid grid grid-cols-1 gap-px overflow-hidden rounded-lg border border-border bg-border sm:grid-cols-2">
         <div className="bg-bg p-4">
@@ -1788,7 +1816,7 @@ const About = () => (
           <a
             href={REPO}
             target="_blank"
-            rel="noopener"
+            rel="noreferrer noopener"
             className="mt-1 inline-block text-[13px] text-fg hover:text-accent"
           >
             github.com/{BRAND.owner}/make-x-great-again ↗
@@ -1799,7 +1827,7 @@ const About = () => (
           <a
             href={`${EDGE_DEFAULT}/list`}
             target="_blank"
-            rel="noopener"
+            rel="noreferrer noopener"
             className="mt-1 inline-block text-[13px] text-fg hover:text-accent"
           >
             最近 100 条已确认 ↗
@@ -1810,7 +1838,7 @@ const About = () => (
           <a
             href={BRAND.governance}
             target="_blank"
-            rel="noopener"
+            rel="noreferrer noopener"
             className="mt-1 inline-block text-[13px] text-fg hover:text-accent"
           >
             申诉与移除机制 ↗
@@ -1818,7 +1846,8 @@ const About = () => (
         </div>
       </div>
       <p className="text-[12px] text-fg-3">
-        隐私：除公开的 X 数字 ID 外不存储任何个人信息，数据默认仅在本机。AI 判定永不自动公开，须人工或社区共识（≥3 个独立 GitHub 上报人）确认。
+        隐私：除公开的 X 数字 ID 外不存储任何个人信息，数据默认仅在本机。AI
+        判定永不自动公开，须人工或社区共识（≥3 个独立 GitHub 上报人）确认。
       </p>
     </div>
   </Page>
@@ -1830,13 +1859,7 @@ const About = () => (
 // than the popup's 32px version.
 const MASCOT_URL = chrome.runtime.getURL("icon/128.png");
 const Mascot = () => (
-  <img
-    src={MASCOT_URL}
-    alt={BRAND.name}
-    width={28}
-    height={28}
-    className="flex-none rounded-md"
-  />
+  <img src={MASCOT_URL} alt={BRAND.name} width={28} height={28} className="flex-none rounded-md" />
 );
 
 function BrandLockup() {
@@ -1866,10 +1889,668 @@ function WhitelistPage() {
   );
 }
 
+const DISTILL_STATUS_ZH: Record<DistillStatus, [string, string]> = {
+  added: ["已学到新规则", "text-ok"],
+  all_rejected: ["候选全被体检拦下", "text-fg-2"],
+  no_signatures: ["AI 认为无可复用特征", "text-fg-3"],
+  not_configured: ["未配置 AI 接口", "text-danger"],
+  error: ["调用失败", "text-danger"],
+};
+
+const STATUS_ZH: Record<LearnedStatus, [string, string]> = {
+  trusted: ["可信 · 自动定罪", "text-danger"],
+  candidate: ["候选 · 仅送审", "text-fg-2"],
+  retired: ["已退役", "text-fg-3"],
+};
+
+/** 一条学到的规则。 */
+function RuleRow({
+  r,
+  onStatus,
+  onRemove,
+}: {
+  r: LearnedRule;
+  onStatus: (s: LearnedStatus) => void;
+  onRemove: () => void;
+}) {
+  const [label, tone] = STATUS_ZH[r.status];
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 rounded-lg border border-border-2 p-3">
+      <div className="min-w-0 flex-1 sm:min-w-[220px]">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium text-fg">{describeRule(r)}</span>
+          <span className={`text-[11px] font-semibold ${tone}`}>{label}</span>
+          <span className="text-[11px] text-fg-3">{CATEGORY_ZH[r.cat]}</span>
+        </div>
+        <div className="mt-0.5 text-[12px] text-fg-3">
+          命中 {r.hits.length} 个账号 · 确认 {r.confirms} · 否决 {r.rejects}
+          {r.status === "candidate" && (
+            <> · 距自动定罪还差 {Math.max(0, PROMOTE_MIN_ACCOUNTS - r.confirms)} 次确认</>
+          )}
+        </div>
+        {r.why && <div className="mt-0.5 text-[12px] text-fg-3">{r.why}</div>}
+        {r.retiredReason && (
+          <div className="mt-0.5 text-[12px] text-fg-3">停用原因：{r.retiredReason}</div>
+        )}
+      </div>
+      <div className="flex flex-none gap-1.5">
+        {/* 只有候选才谈得上「升为可信」。已退役的先恢复到候选，再决定要不要
+            提级 —— 一步从退役跳到自动定罪，正好绕开了退役想拦的那件事。 */}
+        {r.status === "candidate" && (
+          <Btn size="sm" onClick={() => onStatus("trusted")}>
+            升为可信
+          </Btn>
+        )}
+        {r.status !== "retired" ? (
+          <Btn size="sm" onClick={() => onStatus("retired")}>
+            停用
+          </Btn>
+        ) : (
+          <Btn size="sm" onClick={() => onStatus("candidate")}>
+            恢复
+          </Btn>
+        )}
+        <Btn size="sm" tier="danger" onClick={onRemove}>
+          删除
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+function Learning() {
+  const [cfg, setCfg] = useState<LlmConfig | null>(null);
+  const [rules, setRules] = useState<LearnedRule[] | null>(null);
+  const [log, setLog] = useState<DistillLogEntry[] | null>(null);
+  const [dry, setDry] = useState<DryRunResult | null>(null);
+  const [th, setTh] = useState<TemplateThresholds | null>(null);
+  const [tName, setTName] = useState("");
+  const [tBio, setTBio] = useState("");
+  const [tTweet, setTTweet] = useState("");
+  const [filter, setFilter] = useState<LearnedStatus | "all">("all");
+  const [testMsg, setTestMsg] = useState("");
+  const [busy, setBusy] = useState("");
+  const [proposal, setProposal] = useState<ConsolidateProposal | null>(null);
+  const [newTerm, setNewTerm] = useState("");
+  const [newField, setNewField] = useState<LearnedField>("any");
+  const [newCat, setNewCat] = useState<SpamCategory>("porn");
+  const [note, setNote] = useState("");
+
+  const load = () => {
+    void getRules().then((l) => setRules([...l].sort((a, b) => b.updatedAt - a.updatedAt)));
+    void getDistillLog().then(setLog);
+    void getThresholds().then(setTh);
+  };
+  useEffect(() => {
+    void getLlmConfig().then(setCfg);
+    load();
+  }, []);
+
+  const patch = async (p: Partial<LlmConfig>) => setCfg(await setLlmConfig(p));
+
+  const ask = async (type: "llm_test" | "consolidate") => {
+    try {
+      const r = await chrome.runtime.sendMessage({ type });
+      if (!r?.ok)
+        throw new Error(r?.error === "llm_not_configured" ? "尚未配置 AI 接口" : r?.error);
+      return r.data as unknown;
+    } catch (e) {
+      throw e instanceof Error ? e : new Error(String(e));
+    }
+  };
+
+  const shown = (rules ?? []).filter((r) => filter === "all" || r.status === filter);
+  const counts = {
+    trusted: (rules ?? []).filter((r) => r.status === "trusted").length,
+    candidate: (rules ?? []).filter((r) => r.status === "candidate").length,
+    retired: (rules ?? []).filter((r) => r.status === "retired").length,
+  };
+
+  return (
+    <Page title="模型学习" sub="每次手动拉黑都会让模型多学一点；一切规则可复核可撤销">
+      <div className="max-w-[760px] space-y-9">
+        <section>
+          <SectionH>AI 判定接口</SectionH>
+          <p className="mb-3 text-[12px] leading-relaxed text-fg-3">
+            本地模型不表态的账号交给它判定，手动拉黑后也由它蒸馏出新规则。
+            密钥只存在本机，不经过任何第三方服务器；未配置时扩展只用本地模型，功能不受影响。
+          </p>
+          {cfg && (
+            <div className="space-y-2">
+              <Toggle
+                on={cfg.enabled}
+                onChange={(v) => void patch({ enabled: v })}
+                label="启用 AI 判定"
+                hint="关闭后只用本地模型，也不再学习新规则"
+              />
+              {(
+                [
+                  ["base", "接口地址", "https://api.example.com/v1"],
+                  ["key", "API Key", "sk-…"],
+                  ["model", "模型名", "grok-4.5"],
+                ] as const
+              ).map(([k, label, ph]) => (
+                <label key={k} className="block">
+                  <span className="mb-1 block text-[12px] font-semibold text-fg">{label}</span>
+                  <input
+                    type={k === "key" ? "password" : "text"}
+                    value={cfg[k]}
+                    placeholder={ph}
+                    onChange={(e) => setCfg({ ...cfg, [k]: e.target.value })}
+                    onBlur={(e) => void patch({ [k]: e.target.value })}
+                    className="w-full rounded-md border border-border-2 bg-card px-2.5 py-1.5 text-[13px] text-fg outline-none focus:border-fg-3"
+                  />
+                </label>
+              ))}
+              <div className="flex items-center gap-3 pt-1">
+                <Btn
+                  size="sm"
+                  disabled={busy === "test"}
+                  onClick={async () => {
+                    setBusy("test");
+                    setTestMsg("");
+                    try {
+                      const d = (await ask("llm_test")) as { ms: number; label: string };
+                      setTestMsg(`连接正常 · ${d.ms}ms · 样本判定「${d.label}」`);
+                    } catch (e) {
+                      setTestMsg(`失败：${e instanceof Error ? e.message : String(e)}`);
+                    } finally {
+                      setBusy("");
+                    }
+                  }}
+                >
+                  {busy === "test" ? "测试中…" : "测试连接"}
+                </Btn>
+                {testMsg && <span className="text-[12px] text-fg-2">{testMsg}</span>}
+              </div>
+            </div>
+          )}
+        </section>
+
+        <section>
+          <SectionH>学到的规则</SectionH>
+          <p className="mb-3 text-[12px] leading-relaxed text-fg-3">
+            规则分两级，这是本设计不会误杀的关键：
+            <b className="text-fg-2">候选</b>命中只把账号送去 AI 复核（学错的代价是一次调用），
+            连续被 {PROMOTE_MIN_ACCOUNTS} 个不同账号确认且零否决才升为
+            <b className="text-fg-2">可信</b>并允许自动处理。
+            任何一次「恢复显示」都会立刻停用会打中该账号的全部规则。
+          </p>
+          <div className="mb-3 flex flex-wrap gap-1.5">
+            {(
+              [
+                ["all", `全部 ${(rules ?? []).length}`],
+                ["trusted", `可信 ${counts.trusted}`],
+                ["candidate", `候选 ${counts.candidate}`],
+                ["retired", `已退役 ${counts.retired}`],
+              ] as const
+            ).map(([v, label]) => (
+              <button
+                key={v}
+                type="button"
+                onClick={() => setFilter(v)}
+                className={`rounded-md border px-2.5 py-1 text-[12px] transition ${
+                  filter === v ? "border-fg bg-card-hi text-fg" : "border-border-2 text-fg-3"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {rules === null ? (
+            <p className="text-[13px] text-fg-3">载入中…</p>
+          ) : shown.length === 0 ? (
+            <p className="text-[13px] text-fg-3">
+              还没有规则。在 X 上手动拉黑一个垃圾账号，模型就会从中学习。
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {shown.map((r) => (
+                <RuleRow
+                  key={r.id}
+                  r={r}
+                  onStatus={async (s) => {
+                    await setStatus(r.id, s);
+                    load();
+                  }}
+                  onRemove={async () => {
+                    await removeRule(r.id);
+                    load();
+                  }}
+                />
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section>
+          <SectionH>推文模板匹配</SectionH>
+          <p className="mb-3 text-[12px] leading-relaxed text-fg-3">
+            你每次手动拉黑，那条推文原文都会被原样存下来。之后任何账号发出
+            <b className="text-fg-2">足够相似</b>的推文就直接处理 —— 这一路是纯本地计算，不经过
+            AI，接口没配也照常工作。
+            <br />
+            实测参考：同一批号换掉句尾和 @目标后相似度约 <b className="text-fg-2">0.50</b>；
+            该模板与 15 条正常中文推文的最高相似度只有 <b className="text-fg-2">0.19</b>。
+          </p>
+          {th && (
+            <div className="space-y-4">
+              {(
+                [
+                  ["banAt", "直接处理阈值", "达到即按上面配置的动作处理。调高更保守。"],
+                  ["llmAt", "送 AI 复核阈值", "像但不够像，交 AI 判一次。必须低于上面那档。"],
+                ] as const
+              ).map(([k, label, hint]) => (
+                <div key={k}>
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-[12px] font-semibold text-fg">{label}</span>
+                    <span className="font-mono text-[13px] tabular-nums text-fg">
+                      {th[k].toFixed(2)}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.2}
+                    max={0.9}
+                    step={0.05}
+                    value={th[k]}
+                    onChange={(e) => setTh({ ...th, [k]: Number(e.target.value) })}
+                    onMouseUp={() => void setThresholds(th)}
+                    onTouchEnd={() => void setThresholds(th)}
+                    className="w-full accent-fg"
+                  />
+                  <p className="text-[12px] text-fg-3">{hint}</p>
+                </div>
+              ))}
+              {th.llmAt >= th.banAt && (
+                <p className="text-[12px] text-danger">
+                  复核阈值应当低于直接处理阈值，否则中间那档不存在，等于只有一档。
+                </p>
+              )}
+            </div>
+          )}
+        </section>
+
+        <section>
+          <SectionH>手动新增规则</SectionH>
+          <p className="mb-2 text-[12px] leading-relaxed text-fg-3">
+            仍然要过同一套准入体检（长度下限、永不学习名单、拿已确认正常的账号回扫）。
+            新增的规则同样从候选层起步。
+          </p>
+          <div className="flex flex-wrap items-end gap-2">
+            <input
+              value={newTerm}
+              placeholder="要匹配的词，如 上门服务"
+              onChange={(e) => setNewTerm(e.target.value)}
+              className="min-w-[180px] flex-1 rounded-md border border-border-2 bg-card px-2.5 py-1.5 text-[13px] text-fg outline-none focus:border-fg-3"
+            />
+            <select
+              value={newField}
+              onChange={(e) => setNewField(e.target.value as LearnedField)}
+              className="rounded-md border border-border-2 bg-card px-2 py-1.5 text-[13px] text-fg"
+            >
+              <option value="any">任意字段</option>
+              <option value="name">昵称</option>
+              <option value="bio">简介</option>
+              <option value="tweet">推文</option>
+            </select>
+            <select
+              value={newCat}
+              onChange={(e) => setNewCat(e.target.value as SpamCategory)}
+              className="rounded-md border border-border-2 bg-card px-2 py-1.5 text-[13px] text-fg"
+            >
+              {SPAM_CATEGORIES.map((c) => (
+                <option key={c} value={c}>
+                  {CATEGORY_ZH[c]}
+                </option>
+              ))}
+            </select>
+            <Btn
+              size="sm"
+              onClick={async () => {
+                if (!newTerm.trim()) return;
+                const rep = await addManual({
+                  kind: "phrase",
+                  field: newField,
+                  terms: [newTerm.trim()],
+                  cat: newCat,
+                  why: "维护者手动新增",
+                });
+                setNote(
+                  rep.added.length
+                    ? "已新增，处于候选层"
+                    : `未通过体检：${rep.rejected[0]?.reason ?? "未知原因"}`,
+                );
+                if (rep.added.length) setNewTerm("");
+                load();
+              }}
+            >
+              新增
+            </Btn>
+          </div>
+          {note && <p className="mt-2 text-[12px] text-fg-2">{note}</p>}
+        </section>
+
+        <section>
+          <SectionH>让 AI 通审规则库</SectionH>
+          <p className="mb-3 text-[12px] leading-relaxed text-fg-3">
+            把现有规则、它们的战绩、以及你标记过为正常的账号一起交给 AI，
+            让它找出过宽的、重复的、以及本该命中却没命中的。 结果只是
+            <b className="text-fg-2">提案</b>，必须你逐条确认才会生效。
+          </p>
+          <Btn
+            disabled={busy === "audit"}
+            onClick={async () => {
+              setBusy("audit");
+              setProposal(null);
+              try {
+                setProposal((await ask("consolidate")) as ConsolidateProposal);
+              } catch (e) {
+                setNote(`通审失败：${e instanceof Error ? e.message : String(e)}`);
+              } finally {
+                setBusy("");
+              }
+            }}
+          >
+            {busy === "audit" ? "分析中…" : "开始通审"}
+          </Btn>
+          {proposal && (
+            <div className="mt-3 space-y-3">
+              {proposal.retire.length === 0 && proposal.merge.length === 0 && (
+                <p className="text-[13px] text-fg-2">没有建议停用或合并的规则。</p>
+              )}
+              {proposal.retire.length > 0 && (
+                <div>
+                  <div className="mb-1.5 text-[12px] font-semibold text-fg">
+                    建议停用 {proposal.retire.length} 条
+                  </div>
+                  <div className="space-y-1.5">
+                    {proposal.retire.map((p) => {
+                      const r = (rules ?? []).find((x) => x.id === p.id);
+                      return (
+                        <div
+                          key={p.id}
+                          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border-2 p-2.5"
+                        >
+                          <span className="text-[13px] text-fg">
+                            {r ? describeRule(r) : p.id}
+                            <span className="block text-[12px] text-fg-3">{p.why}</span>
+                          </span>
+                          <Btn
+                            size="sm"
+                            onClick={async () => {
+                              await setStatus(p.id, "retired", p.why || "AI 通审建议停用");
+                              setProposal({
+                                ...proposal,
+                                retire: proposal.retire.filter((x) => x.id !== p.id),
+                              });
+                              load();
+                            }}
+                          >
+                            采纳
+                          </Btn>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+              {proposal.merge.length > 0 && (
+                <div>
+                  <div className="mb-1.5 text-[12px] font-semibold text-fg">
+                    建议合并 {proposal.merge.length} 组（保留第一条，其余停用）
+                  </div>
+                  <div className="space-y-1.5">
+                    {proposal.merge.map((m) => (
+                      <div
+                        key={m.ids.join("-")}
+                        className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border-2 p-2.5"
+                      >
+                        <span className="text-[13px] text-fg">
+                          {m.ids
+                            .map((id) => {
+                              const r = (rules ?? []).find((x) => x.id === id);
+                              return r ? describeRule(r) : id;
+                            })
+                            .join(" / ")}
+                          <span className="block text-[12px] text-fg-3">{m.why}</span>
+                        </span>
+                        <Btn
+                          size="sm"
+                          onClick={async () => {
+                            for (const id of m.ids.slice(1)) {
+                              await setStatus(id, "retired", "AI 通审：与同组规则重复");
+                            }
+                            setProposal({
+                              ...proposal,
+                              merge: proposal.merge.filter((x) => x !== m),
+                            });
+                            load();
+                          }}
+                        >
+                          采纳
+                        </Btn>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {proposal.notes.length > 0 && (
+                <div>
+                  <div className="mb-1.5 text-[12px] font-semibold text-fg">AI 的其他观察</div>
+                  <ul className="list-inside list-disc space-y-1 text-[12px] text-fg-3">
+                    {proposal.notes.map((n) => (
+                      <li key={n}>{n}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+
+        <section>
+          <SectionH>试学（不写入）</SectionH>
+          <p className="mb-3 text-[12px] leading-relaxed text-fg-3">
+            粘一条真实样本，走完整的 AI 蒸馏 + 准入体检，但**不落库**。
+            它能一次看清「没学到规则」到底是哪种原因：没配接口 / 调用失败 / AI 没给出签名 /
+            签名被体检拦下。不必真去拉黑一个人。
+          </p>
+          <div className="space-y-2">
+            <input
+              value={tName}
+              placeholder="昵称"
+              onChange={(e) => setTName(e.target.value)}
+              className="w-full rounded-md border border-border-2 bg-card px-2.5 py-1.5 text-[13px] text-fg outline-none focus:border-fg-3"
+            />
+            <input
+              value={tBio}
+              placeholder="简介（可空）"
+              onChange={(e) => setTBio(e.target.value)}
+              className="w-full rounded-md border border-border-2 bg-card px-2.5 py-1.5 text-[13px] text-fg outline-none focus:border-fg-3"
+            />
+            <textarea
+              value={tTweet}
+              placeholder="推文正文，例：30+的al体制内老师 玩的就是返差 @Hop4Toy 9r"
+              rows={2}
+              onChange={(e) => setTTweet(e.target.value)}
+              className="w-full rounded-md border border-border-2 bg-card px-2.5 py-1.5 text-[13px] text-fg outline-none focus:border-fg-3"
+            />
+          </div>
+          <div className="mt-2">
+            <Btn
+              disabled={busy === "dry"}
+              onClick={async () => {
+                setBusy("dry");
+                setDry(null);
+                try {
+                  const r = await chrome.runtime.sendMessage({
+                    type: "distill_test",
+                    sample: { displayName: tName, bio: tBio, tweet: tTweet },
+                  });
+                  setDry(r?.ok ? (r.data as DryRunResult) : null);
+                  if (!r?.ok) setNote(`试学失败：${r?.error ?? "后台无响应"}`);
+                } catch (e) {
+                  setNote(`试学失败：${e instanceof Error ? e.message : String(e)}`);
+                } finally {
+                  setBusy("");
+                }
+              }}
+            >
+              {busy === "dry" ? "运行中…" : "试学这条样本"}
+            </Btn>
+          </div>
+          {dry && (
+            <div className="mt-3 rounded-lg border border-border-2 p-3 text-[13px]">
+              {dry.status === "not_configured" && (
+                <p className="text-danger">尚未配置 AI 判定接口 —— 蒸馏根本没有发生。</p>
+              )}
+              {dry.status === "error" && <p className="text-danger">调用失败：{dry.error}</p>}
+              {dry.status === "no_signatures" && (
+                <p className="text-fg-2">
+                  接口通了，但 AI 认为这条样本里没有可复用的特征 —— 一条签名都没给。
+                  这是提示词太保守，不是配置问题。
+                </p>
+              )}
+              {dry.status === "ok" && (
+                <>
+                  <p className="mb-2 text-fg-2">AI 给出 {dry.signatures.length} 条签名：</p>
+                  <div className="space-y-1.5">
+                    {dry.checks.map((c, i) => {
+                      const sig = dry.signatures[i];
+                      return (
+                        <div
+                          key={c.terms.join("+")}
+                          className="flex flex-wrap items-baseline gap-2"
+                        >
+                          <span className="font-medium text-fg">「{c.terms.join("」+「")}」</span>
+                          {sig && (
+                            <span className="text-[12px] text-fg-3">
+                              {sig.field} · {CATEGORY_ZH[sig.cat as SpamCategory] ?? sig.cat}
+                            </span>
+                          )}
+                          {c.ok ? (
+                            <span className="text-[12px] font-semibold text-ok">体检通过</span>
+                          ) : (
+                            <span className="text-[12px] text-fg-2">被拦下：{c.reason}</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {dry.checks.every((c) => !c.ok) && (
+                    <p className="mt-2 text-[12px] text-fg-3">
+                      全部被拦下 —— 真跑时这条样本同样学不到东西。上面每条的理由就是原因。
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </section>
+
+        <section>
+          <SectionH>最近学习记录</SectionH>
+          <p className="mb-3 text-[12px] leading-relaxed text-fg-3">
+            每次手动拉黑都会在这里留一条，无论学没学到。
+            「没学到规则」有四种完全不同的原因，这里能直接看出是哪一种。
+          </p>
+          {log === null ? (
+            <p className="text-[13px] text-fg-3">载入中…</p>
+          ) : log.length === 0 ? (
+            <p className="text-[13px] text-fg-3">还没有记录。在 X 上手动拉黑一个垃圾账号即可。</p>
+          ) : (
+            <>
+              <div className="space-y-2">
+                {log.map((e) => {
+                  const [zh, tone] = DISTILL_STATUS_ZH[e.status];
+                  return (
+                    <div
+                      key={`${e.ts}-${e.handle}`}
+                      className="rounded-lg border border-border-2 p-3"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <HandleLink handle={e.handle} />
+                        <span className={`text-[11px] font-semibold ${tone}`}>{zh}</span>
+                        <span className="text-[11px] text-fg-3">{when(e.ts)}</span>
+                      </div>
+                      <div className="mt-0.5 break-words text-[12px] text-fg-3">{e.sample}</div>
+                      {e.added.length > 0 && (
+                        <div className="mt-1 text-[12px] text-fg-2">学到：{e.added.join("；")}</div>
+                      )}
+                      {e.rejected.length > 0 && (
+                        <div className="mt-1 text-[12px] text-fg-3">
+                          被体检拒绝：
+                          {e.rejected.map((r) => `「${r.terms.join("+")}」${r.reason}`).join("；")}
+                        </div>
+                      )}
+                      {e.error && <div className="mt-1 text-[12px] text-danger">{e.error}</div>}
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="mt-3">
+                <Btn
+                  size="sm"
+                  onClick={async () => {
+                    await clearDistillLog();
+                    setLog([]);
+                  }}
+                >
+                  清空记录
+                </Btn>
+              </div>
+            </>
+          )}
+        </section>
+
+        <section>
+          <SectionH>导入 / 导出</SectionH>
+          <div className="flex flex-wrap items-center gap-3">
+            <Btn
+              size="sm"
+              onClick={async () => {
+                const blob = new Blob([await exportRules()], { type: "application/json" });
+                const a = document.createElement("a");
+                a.href = URL.createObjectURL(blob);
+                a.download = "mxga-learned-rules.json";
+                a.click();
+                URL.revokeObjectURL(a.href);
+              }}
+            >
+              导出规则
+            </Btn>
+            <label className="cursor-pointer text-[13px] text-fg-2 underline">
+              导入规则
+              <input
+                type="file"
+                accept="application/json"
+                className="hidden"
+                onChange={async (e) => {
+                  const f = e.target.files?.[0];
+                  if (!f) return;
+                  try {
+                    setNote(`已导入 ${await importRules(await f.text())} 条新规则`);
+                  } catch (err) {
+                    setNote(`导入失败：${err instanceof Error ? err.message : String(err)}`);
+                  }
+                  load();
+                }}
+              />
+            </label>
+            <TrainingExport />
+          </div>
+        </section>
+      </div>
+    </Page>
+  );
+}
+
 const TABS = [
   ["overview", "概览", Overview],
   ["blocklist", "处理记录", Blocklist],
   ["cache", "检测缓存", Cache],
+  ["learning", "模型学习", Learning],
   ["settings", "设置", Settings],
   ["whitelist", "保护我的账号", WhitelistPage],
   ["about", "关于", About],
@@ -1906,7 +2587,7 @@ function NavigationFooter() {
       <a
         href={`${EDGE_DEFAULT}/list`}
         target="_blank"
-        rel="noopener"
+        rel="noreferrer noopener"
         className="block min-h-11 content-center rounded-md px-3 text-fg-2 hover:bg-card hover:text-fg"
       >
         看公榜 ↗
@@ -1914,7 +2595,7 @@ function NavigationFooter() {
       <a
         href={REPO}
         target="_blank"
-        rel="noopener"
+        rel="noreferrer noopener"
         className="block min-h-11 content-center rounded-md px-3 text-fg-2 hover:bg-card hover:text-fg"
       >
         GitHub ↗
@@ -1954,6 +2635,14 @@ export function App() {
     setMenuOpen(false);
   };
 
+  // 页内 #tab 链接（概览里的「查看与管理」）也要能切页。没有这个监听时
+  // 地址栏变了但内容不变，读起来就是「点了没反应」。
+  useEffect(() => {
+    const onHash = () => setTabState(tabFromLocation());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
   useEffect(() => {
     if (!menuOpen) return;
     const previousOverflow = document.body.style.overflow;
@@ -1980,7 +2669,13 @@ export function App() {
             className="grid h-11 w-11 flex-none place-items-center rounded-lg border border-border-2 bg-card text-fg"
           >
             <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-              <path d="M4 6h16M4 12h16M4 18h16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+              <path
+                d="M4 6h16M4 12h16M4 18h16"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+              />
             </svg>
           </button>
           <BrandLockup />
@@ -2009,7 +2704,13 @@ export function App() {
                   className="grid h-11 w-11 place-items-center rounded-lg text-fg-2 hover:bg-card-hi hover:text-fg"
                 >
                   <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-                    <path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                    <path
+                      d="m6 6 12 12M18 6 6 18"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                    />
                   </svg>
                 </button>
               </div>
@@ -2034,7 +2735,10 @@ export function App() {
         <div className="px-1">
           <BrandLockup />
         </div>
-        <nav className="-mx-1 flex gap-1 overflow-x-auto px-1 pb-1 md:mx-0 md:flex-col md:gap-0.5 md:overflow-visible md:px-0 md:pb-0" aria-label="管理面板导航">
+        <nav
+          className="-mx-1 flex gap-1 overflow-x-auto px-1 pb-1 md:mx-0 md:flex-col md:gap-0.5 md:overflow-visible md:px-0 md:pb-0"
+          aria-label="管理面板导航"
+        >
           <TabButtons active={tab} onSelect={setTab} />
         </nav>
         <div className="mt-auto hidden md:block">

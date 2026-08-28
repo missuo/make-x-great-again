@@ -1,62 +1,23 @@
-import type { CategoryAction, Settings } from "./settings";
-
-/** Where a hit came from, for auto-action eligibility purposes. */
-export type AutoSource = "list" | "rule" | "cache" | "fresh";
+/** 一次命中的来源，决定它能否进入自动处理。 */
+export type AutoSource = "baseline" | "llm" | "cache" | "fresh";
 
 /**
- * Whether a hit may enter the automatic-processing path at all (the
- * per-category action policy is applied after this gate; ineligible hits
- * degrade to badge-only).
+ * 这条命中是否允许自动处理。
  *
- * PRODUCT LINE (2026-07-07, reaffirmed 2026-07-18): on the public list =
- * auto-processable, regardless of tier — precision is enforced at the
- * publish source (AI lane confined to porn_bot; rules maintainer-curated).
- * settings.autoTierMode lets cautious users narrow the auto tier: "full"
- * (default) runs the per-category policy as-is, "hide" admits them but
- * `capAutoTierAction` limits them to the reversible local hide, "badge"
- * keeps the old mark-only stance. Tier gating exists server-side ONLY for
- * legacy ≤0.4 clients (`/v1/check` human-only), which auto-block with no
- * tier awareness and no cap.
+ * 2026-08-12 大幅收窄。曾经这里有一整套分级门禁（autoScope 限定评论区、
+ * autoTierMode 给「自动收录」条目封顶），服务对象是**公榜**和随公榜下发的
+ * 官方关键词规则 —— 两份我们既不控制也审不了的数据。那两条来源已经整个
+ * 移除（公榜里 27.7% 的条目由泛化词单独命中产生，是已确认的误杀来源），
+ * 门禁也就没有了服务对象：留着只是让设置页多两屏选项，且每一项都指向
+ * 一条永远不会发生的分支。
  *
- * Official keyword-rule hits are maintainer-curated but target first-seen
- * accounts with no human review, so they are confined to reply sections
- * regardless of autoScope — AND (2026-07-24) they count as auto-tier for
- * autoTierMode purposes: the options copy promises "仅标记 = 自动收录条目
- * 永不自动处理" and rule hits are exactly that tier, so "badge" must gate
- * them too. Before this they bypassed the tier setting entirely.
+ * 现在只剩两个来源，且两者同档：
+ *   baseline —— 本扩展自己的判定，结构性高精度路径 + 已晋升的学习规则
+ *   llm      —— 我们主动花钱求来的结论（调用点已滤掉 likely_spam/uncertain）
+ * 够不到这两条的账号根本走不到这里：baseline 不表态就是 pass，直接放行。
  *
- * Cache and fresh verdicts never auto-act.
+ * 缓存与中性判定永不自动处理。
  */
-export function autoEligible(opts: {
-  source: AutoSource;
-  tier: "confirmed" | "auto";
-  inReply: boolean;
-  autoScope: Settings["autoScope"];
-  autoTierMode: Settings["autoTierMode"];
-}): boolean {
-  if (opts.source === "list") {
-    if (opts.tier !== "confirmed" && opts.autoTierMode === "badge") return false;
-    return opts.autoScope === "all" || opts.inReply;
-  }
-  if (opts.source === "rule") {
-    if (opts.autoTierMode === "badge") return false;
-    return opts.inReply;
-  }
-  return false;
-}
-
-/** Cap the per-category action for an eligible hit by its tier. Irreversible
- *  X-native mute/block stays human-confirmed-only unless the user explicitly
- *  opted the auto tier into "full"; under "hide" the action degrades to the
- *  local (reversible, zero-network) hide. This covers BOTH auto-tier list
- *  entries and official keyword-rule hits — everything that isn't
- *  human-confirmed (2026-07-24: rule hits used to pass through uncapped,
- *  contradicting the options copy "X 静音/拉黑仍只对人工确认条目执行"). */
-export function capAutoTierAction(
-  action: CategoryAction,
-  opts: { source: AutoSource; tier: "confirmed" | "auto"; autoTierMode: Settings["autoTierMode"] },
-): CategoryAction {
-  if (opts.source === "list" && opts.tier === "confirmed") return action;
-  if (opts.autoTierMode === "full") return action;
-  return action === "badge" ? "badge" : "hide";
+export function autoEligible(opts: { source: AutoSource }): boolean {
+  return opts.source === "baseline" || opts.source === "llm";
 }

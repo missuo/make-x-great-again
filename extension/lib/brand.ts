@@ -24,14 +24,11 @@ export const BRAND = {
   /** Public Worker base URL (custom domain). Extension can override in settings. */
   edgeBase: "https://x.zuoluo.tv",
   /** Governance doc inside the repo. */
-  governance:
-    "https://github.com/foru17/make-x-great-again/blob/main/GOVERNANCE.md",
+  governance: "https://github.com/foru17/make-x-great-again/blob/main/GOVERNANCE.md",
   /** Privacy doc inside the repo. */
-  privacy:
-    "https://github.com/foru17/make-x-great-again/blob/main/docs/PRIVACY.md",
+  privacy: "https://github.com/foru17/make-x-great-again/blob/main/docs/PRIVACY.md",
   /** Appeal / removal request entry (used by content-script bubble). */
-  appealNewIssue:
-    "https://github.com/foru17/make-x-great-again/issues/new?template=appeal.yml",
+  appealNewIssue: "https://github.com/foru17/make-x-great-again/issues/new?template=appeal.yml",
   /** Generic issue tracker URL. */
   issues: "https://github.com/foru17/make-x-great-again/issues",
   /** Owner display name. */

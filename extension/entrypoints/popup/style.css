@@ -27,7 +27,9 @@
   --radius-lg: 10px;
 }
 
-:root { color-scheme: dark light; }
+:root {
+  color-scheme: dark light;
+}
 
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
@@ -79,19 +81,24 @@
    width. A viewport-relative width here creates a circular calculation and
    collapses the toolbar popup to a narrow, translucent strip. Keep the
    desktop intrinsic width fixed; only use the viewport on touch devices. */
-html, body { width: 340px; margin: 0; }
+html,
+body {
+  width: 340px;
+  margin: 0;
+}
 body {
   color: var(--color-fg);
   background: var(--color-bg);
-  font: 13px/1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Inter",
-        "SF Pro Text", "PingFang SC", "Microsoft YaHei", "Segoe UI",
-        system-ui, sans-serif;
+  font: 13px / 1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text",
+    "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   font-feature-settings: "cv11", "ss03";
   transition: background-color .15s ease, color .15s ease;
 }
 
-:focus { outline: none; }
+:focus {
+  outline: none;
+}
 :focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: -1px;
@@ -99,13 +106,24 @@ body {
 }
 
 @media (pointer: coarse) {
-  html, body { width: 100vw; max-width: 340px; }
-  button { min-height: 44px; }
-  a, button { -webkit-tap-highlight-color: transparent; }
+  html,
+  body {
+    width: 100vw;
+    max-width: 340px;
+  }
+  button {
+    min-height: 44px;
+  }
+  a,
+  button {
+    -webkit-tap-highlight-color: transparent;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  *,
+  *::before,
+  *::after {
     animation-duration: .001ms !important;
     transition-duration: .001ms !important;
   }

@@ -21,27 +21,6 @@ export type CategoryAction = "badge" | "hide" | "mute" | "block";
 
 export type CategoryActions = Record<SpamCategory, CategoryAction>;
 
-/** WHERE the per-category auto actions are allowed to fire. Detection and
- *  badges always run everywhere; this only scopes the automatic
- *  hide/mute/block:
- *  - "replies": ONLY accounts replying under a tweet (the status-page 评论区,
- *    where the spam wave actually lives). Feed posts by the account itself
- *    and profile pages are detect-and-badge only. (default — least 误伤)
- *  - "all": feed, profile and replies all auto-process. */
-export type AutoScope = "replies" | "all";
-
-/** How PUBLIC-LIST hits that are auto-published (AI/rule/mention lane, not
- *  human-confirmed) may auto-act. Human-confirmed entries always follow the
- *  per-category policy in full; this only governs the auto tier:
- *  - "full":  run the per-category action incl. mute/block (default — the
- *             product line is "on the public list = auto-processable";
- *             precision is enforced at the publish source, where the AI
- *             lane is confined to the high-precision porn_bot class)
- *  - "hide":  cap at the reversible local hide; X mute/block stays
- *             human-confirmed-only
- *  - "badge": mark only — the most conservative stance */
-export type AutoTierMode = "badge" | "hide" | "full";
-
 export interface Settings {
   enabled: boolean; // master: passive detection on/off
   bubble: boolean; // show the corner bubble
@@ -49,32 +28,32 @@ export interface Settings {
   actionMode: ActionMode; // what "隐藏" does to a flagged account
   categoryActions: CategoryActions; // per-category automatic action on list hits
   autoProcess: boolean; // master kill-switch for categoryActions auto hide/mute/block
-  autoScope: AutoScope; // where auto actions may fire (replies-only by default)
-  autoTierMode: AutoTierMode; // how far auto-published (non-human) list hits may auto-act
   autoExpand: boolean; // pop the bubble card open when auto-processing starts (off = pill pulse only; better on narrow/mobile viewports)
   edgeBase: string; // advanced: override the service base URL — list/whitelist sync source, whitelist-apply backend AND outbound links
 }
 
+// 命中即拉黑 —— 本地部署的默认口径。
+//
+// 之所以敢把默认值从「仅标记」拉到「X 拉黑」，是因为判定源换了：命中不
+// 再来自那份 27.7% 由泛化词单独产生的公榜，而是来自本地 baseline 的三条
+// 结构性高精度路径（人工签字短语 / 高频模板短语 / 整名匹配批量模板）。
+// 够不到这三条的账号 baseline 不表态，根本不会走到这里。
 export const DEFAULT_CATEGORY_ACTIONS: CategoryActions = {
-  // All "badge" by default — identical to the shipped behavior (hits are
-  // marked, nothing happens without the user). Users escalate per category.
-  porn: "badge",
-  crypto: "badge",
-  gambling: "badge",
-  resource: "badge",
-  marketing: "badge",
-  other: "badge",
+  porn: "block",
+  crypto: "block",
+  gambling: "block",
+  resource: "block",
+  marketing: "block",
+  other: "block",
 };
 
 export const DEFAULTS: Settings = {
   enabled: true,
   bubble: true,
   bubblePos: "tr",
-  actionMode: "local",
+  actionMode: "block",
   categoryActions: { ...DEFAULT_CATEGORY_ACTIONS },
   autoProcess: true,
-  autoScope: "replies",
-  autoTierMode: "full",
   autoExpand: true,
   edgeBase: "",
 };
@@ -103,10 +82,7 @@ export async function getSettings(): Promise<Settings> {
   }
 }
 
-export async function setSetting<K extends keyof Settings>(
-  k: K,
-  v: Settings[K],
-): Promise<void> {
+export async function setSetting<K extends keyof Settings>(k: K, v: Settings[K]): Promise<void> {
   try {
     const s = await getSettings();
     await chrome.storage.local.set({ [KEY]: { ...s, [k]: v } });
@@ -126,10 +102,7 @@ export async function setCategoryAction(
 
 /** Fires whenever settings change (any tab/page). Returns an unsubscribe. */
 export function onSettingsChange(cb: (s: Settings) => void): () => void {
-  const h = (
-    changes: Record<string, chrome.storage.StorageChange>,
-    area: string,
-  ) => {
+  const h = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
     if (area === "local" && changes[KEY]) {
       cb(withDefaults(changes[KEY].newValue as Partial<Settings>));
     }

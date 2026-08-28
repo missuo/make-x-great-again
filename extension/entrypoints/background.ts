@@ -1,8 +1,9 @@
 // Background service worker: owns the remote blocklist sync (download-only —
 // a public artifact GET; nothing about the user is ever uploaded) and serves
 // local health/stats lookups for the popup.
+import type { DistillLogEntry } from "../lib/learned-store";
 import { syncIfStale, syncList } from "../lib/list-sync";
-import type { BgRequest, BgResponse } from "../lib/types";
+import type { BgRequest, BgResponse, DryRunResult, Signals } from "../lib/types";
 
 // ---- GitHub Device Flow (v0.4's login interaction, restored for the
 // whitelist self-service). Public device-flow client id — NOT a secret
@@ -44,6 +45,124 @@ async function ghPoll(deviceCode: string) {
   const user = (await u.json()) as { login?: string };
   await setGh(j.access_token, user.login ?? "github");
   return { login: user.login ?? "github" };
+}
+
+/**
+ * 自学习循环 1：从一个用户亲手确认的垃圾账号里蒸馏可复用规则。
+ *
+ * 每一条分支都写日志，包括「没配 AI」和「模型一条签名都没给」。
+ * 「没学到规则」在外部看来是同一种沉默，但底下是四种完全不同的原因，
+ * 分不出来就没法排查 —— 这个函数的返回值和日志就是唯一的诊断入口。
+ *
+ * 任何失败都不向上抛：蒸馏是锦上添花，绝不能影响用户已经做出的那次拉黑。
+ */
+async function runDistill(sig: Signals, note?: string): Promise<DistillLogEntry> {
+  const { appendDistillLog } = await import("../lib/learned-store");
+  const sample = [sig.displayName, sig.bio, sig.triggeringComment ?? sig.recentTweets[0] ?? ""]
+    .filter(Boolean)
+    .join(" · ")
+    .slice(0, 200);
+  const base = { ts: Date.now(), handle: sig.handle, displayName: sig.displayName, sample };
+
+  const write = async (e: DistillLogEntry) => {
+    await appendDistillLog(e);
+    return e;
+  };
+
+  try {
+    const { distill, llmEnabled } = await import("../lib/llm");
+    if (!(await llmEnabled())) {
+      return write({ ...base, status: "not_configured", added: [], rejected: [] });
+    }
+    const sigs = await distill({
+      handle: sig.handle,
+      displayName: sig.displayName,
+      bio: sig.bio,
+      recentTweets: sig.recentTweets,
+      triggeringComment: sig.triggeringComment,
+      note,
+    });
+    if (!sigs.length) {
+      return write({ ...base, status: "no_signatures", added: [], rejected: [] });
+    }
+    const { addDrafts } = await import("../lib/learned-store");
+    const report = await addDrafts(sigs);
+    const { describeRule } = await import("../../src/baseline/learned.ts");
+    return write({
+      ...base,
+      status: report.added.length ? "added" : "all_rejected",
+      added: report.added.map(describeRule),
+      rejected: report.rejected,
+    });
+  } catch (e) {
+    return write({
+      ...base,
+      status: "error",
+      added: [],
+      rejected: [],
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+/**
+ * 试学：跑完整的蒸馏 + 准入体检，但**不写任何东西**。
+ *
+ * 存在的理由是可诊断性。「没学到规则」有四种原因（没配 AI、调用失败、
+ * 模型没给签名、签名被体检拦下），它们在外部表现完全一致，但需要完全
+ * 不同的处理。这个入口把四选一压成一次点击，而且不需要真拉黑一个人。
+ */
+async function dryRunDistill(sample: {
+  displayName: string;
+  bio: string;
+  tweet: string;
+}): Promise<DryRunResult> {
+  try {
+    const { distill, llmEnabled } = await import("../lib/llm");
+    if (!(await llmEnabled())) {
+      return { status: "not_configured", signatures: [], checks: [] };
+    }
+    const sigs = await distill({
+      handle: "preview",
+      displayName: sample.displayName,
+      bio: sample.bio,
+      recentTweets: sample.tweet ? [sample.tweet] : [],
+    });
+    const signatures = sigs.map((s) => ({
+      terms: s.terms,
+      field: s.field,
+      cat: s.cat,
+      why: s.why,
+    }));
+    if (!sigs.length) return { status: "no_signatures", signatures, checks: [] };
+    // 体检用**真实**的负样本与现存规则，否则试学结果和真跑不一致，
+    // 那比没有这个功能更糟。
+    const { getRules, negativeCorpus } = await import("../lib/learned-store");
+    const { admit } = await import("../../src/baseline/learned.ts");
+    const { getThresholds } = await import("../lib/learned-store");
+    const guards = {
+      negatives: await negativeCorpus(),
+      existing: await getRules(),
+      thresholds: await getThresholds(),
+    };
+    return {
+      status: "ok",
+      signatures,
+      checks: sigs.map((d) => {
+        const got = admit(d, guards);
+        return got.ok
+          ? { terms: d.terms, ok: true }
+          : { terms: d.terms, ok: false, reason: got.reason };
+      }),
+    };
+  } catch (e) {
+    return {
+      status: "error",
+      signatures: [],
+      checks: [],
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
 }
 
 const SYNC_ALARM = "xss:list-sync";
@@ -107,6 +226,42 @@ export default defineBackground(() => {
           } else if (msg.type === "open_options") {
             chrome.runtime.openOptionsPage();
             sendResponse({ ok: true });
+          } else if (msg.type === "classify") {
+            // baseline 中间带兜底。判定结果直接回给内容脚本，由它决定动作
+            // 并写入本地缓存 —— background 不落库，保持无状态。
+            const { classify, llmEnabled } = await import("../lib/llm");
+            if (!(await llmEnabled())) {
+              sendResponse({ ok: false, error: "llm_not_configured" });
+            } else {
+              const verdict = await classify(msg.sig);
+              sendResponse({ ok: true, data: verdict });
+            }
+          } else if (msg.type === "distill") {
+            sendResponse({ ok: true, data: await runDistill(msg.sig, msg.note) });
+          } else if (msg.type === "distill_test") {
+            sendResponse({ ok: true, data: await dryRunDistill(msg.sample) });
+          } else if (msg.type === "consolidate") {
+            const { consolidate, llmEnabled } = await import("../lib/llm");
+            if (!(await llmEnabled())) {
+              sendResponse({ ok: false, error: "llm_not_configured" });
+            } else {
+              const { getRules, negativeCorpus } = await import("../lib/learned-store");
+              const rules = (await getRules()).filter((r) => r.status !== "retired");
+              if (!rules.length) {
+                sendResponse({ ok: true, data: { retire: [], merge: [], notes: [] } });
+              } else {
+                sendResponse({
+                  ok: true,
+                  data: await consolidate(
+                    rules,
+                    (await negativeCorpus()).map((n) => n.text),
+                  ),
+                });
+              }
+            }
+          } else if (msg.type === "llm_test") {
+            const { testConnection } = await import("../lib/llm");
+            sendResponse({ ok: true, data: await testConnection() });
           } else if (msg.type === "report") {
             // Authenticated POST /v1/report from the SHARED extension origin
             // (same path the whitelist-apply flow uses), not the content

@@ -128,9 +128,7 @@ async function getBundledSafariList(): Promise<StoredList | null> {
         ? raw.generatedAt
         : Date.now();
     return {
-      version:
-        parsed.value.version ??
-        `bundled-${generatedAt}-${parsed.value.entries.length}`,
+      version: parsed.value.version ?? `bundled-${generatedAt}-${parsed.value.entries.length}`,
       fetchedAt: generatedAt,
       count: parsed.value.entries.length,
       entries: parsed.value.entries,
@@ -157,25 +155,18 @@ function requestBackgroundSync(): void {
  *  first page load; remote sync still replaces it as soon as it succeeds. */
 export async function warmLocalIndex(): Promise<void> {
   if (warmed) return;
+  // 远端黑名单已停用 —— 只预热白名单。
+  //
+  // 以前这里在拿不到黑名单缓存时会去 fetch 打包的 Safari 快照，再触发一次
+  // 后台同步。黑名单停用后缓存永远是空的，那条兜底就变成了每次页面加载都
+  // 白跑一遍：多一次注定失败的 runtime fetch，多一次没意义的同步请求。
+  // 黑名单已经不参与判定了，加载它没有任何意义。
   const wl = await getStoredWhitelist();
   if (wl) buildWhitelist(wl);
-  const stored = await getStoredList();
-  if (stored) {
-    buildMaps(stored);
-    warmed = true;
-    return;
-  }
-
-  const bundled = await getBundledSafariList();
-  if (bundled) {
-    buildMaps(bundled);
-    warmed = true;
-    requestBackgroundSync();
-    return;
-  }
-
   userIdMap ??= new Map();
   handleMap ??= new Map();
+  warmed = true;
+  // 白名单仍需保持新鲜：它是对 baseline / 大模型误判的最后一道保险。
   requestBackgroundSync();
 }
 

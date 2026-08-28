@@ -33,10 +33,7 @@ export async function getStats(): Promise<LocalStats> {
   });
 }
 
-export async function bumpStatBy(
-  key: keyof Omit<LocalStats, "firstUsedAt">,
-  n = 1,
-): Promise<void> {
+export async function bumpStatBy(key: keyof Omit<LocalStats, "firstUsedAt">, n = 1): Promise<void> {
   const cur = await getStats();
   cur[key] = (cur[key] ?? 0) + Math.max(0, Math.floor(n));
   // Set firstUsedAt the first time we bump anything from a fresh install.

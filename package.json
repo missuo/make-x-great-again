@@ -10,7 +10,10 @@
   },
   "scripts": {
     "classify": "tsx src/cli.ts",
+    "baseline:train": "tsx scripts/baseline/train.ts",
+    "baseline:eval": "tsx scripts/baseline/eval.ts",
     "serve": "tsx src/server.ts",
+    "release:zip": "bash scripts/release-zip.sh",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint src test services/edge/src services/edge/app",
     "format": "biome format --write .",

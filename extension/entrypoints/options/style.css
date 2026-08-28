@@ -26,7 +26,9 @@
   --radius-lg: 10px;
 }
 
-:root { color-scheme: dark light; }
+:root {
+  color-scheme: dark light;
+}
 
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
@@ -72,27 +74,33 @@
   --color-violet: #7e22ce;
 }
 
-html, body { margin: 0; }
+html,
+body {
+  margin: 0;
+}
 body {
   min-width: 0;
   color: var(--color-fg);
   background: var(--color-bg);
-  font: 14px/1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Inter",
-        "SF Pro Text", "PingFang SC", "Microsoft YaHei", "Segoe UI",
-        system-ui, sans-serif;
+  font: 14px / 1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text",
+    "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   font-feature-settings: "cv11", "ss03";
   transition: background-color .15s ease, color .15s ease;
 }
 
-:focus { outline: none; }
+:focus {
+  outline: none;
+}
 :focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: -1px;
   border-radius: var(--radius);
 }
 
-.mobile-record-list { display: none; }
+.mobile-record-list {
+  display: none;
+}
 
 /* Safari on iPhone can expose a desktop-like extension-page viewport even
    though the page is shown in a narrow sheet. The runtime iOS shell is the
@@ -116,7 +124,10 @@ body {
   animation: mxga-drawer-in .2s ease-out;
 }
 @keyframes mxga-drawer-in {
-  from { transform: translateX(-24px); opacity: .65; }
+  from {
+    transform: translateX(-24px);
+    opacity: 0.65;
+  }
 }
 .ios-mobile-shell .mxga-page {
   width: 100%;
@@ -125,13 +136,21 @@ body {
   padding: 24px max(16px, env(safe-area-inset-right)) max(32px, env(safe-area-inset-bottom));
   padding-left: max(16px, env(safe-area-inset-left));
 }
-.ios-mobile-shell .mxga-page > h1 { font-size: 24px; }
-.ios-mobile-shell .mxga-page > h1 + div { margin-bottom: 20px; }
+.ios-mobile-shell .mxga-page > h1 {
+  font-size: 24px;
+}
+.ios-mobile-shell .mxga-page > h1 + div {
+  margin-bottom: 20px;
+}
 .ios-mobile-shell .overview-stats {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
-.ios-mobile-shell .overview-stat-card { padding: 16px; }
-.ios-mobile-shell .overview-stat-card > div:first-child { font-size: 24px; }
+.ios-mobile-shell .overview-stat-card {
+  padding: 16px;
+}
+.ios-mobile-shell .overview-stat-card > div:first-child {
+  font-size: 24px;
+}
 .ios-mobile-shell .list-status-card {
   display: block;
   padding: 16px;
@@ -146,7 +165,9 @@ body {
   display: block;
   margin-left: 0;
 }
-.ios-mobile-shell .list-status-stat b { font-size: 18px; }
+.ios-mobile-shell .list-status-stat b {
+  font-size: 18px;
+}
 .ios-mobile-shell .list-status-meta {
   grid-column: 1 / -1;
   line-height: 1.6;
@@ -157,8 +178,12 @@ body {
   align-items: stretch;
   flex-direction: column;
 }
-.ios-mobile-shell .list-status-actions button { width: 100%; }
-.ios-mobile-shell .desktop-record-table { display: none; }
+.ios-mobile-shell .list-status-actions button {
+  width: 100%;
+}
+.ios-mobile-shell .desktop-record-table {
+  display: none;
+}
 .ios-mobile-shell .mobile-record-list {
   display: grid;
   gap: 12px;
@@ -170,13 +195,19 @@ body {
   border-radius: 12px;
   background: var(--color-card);
 }
-.ios-mobile-shell .mobile-record-action { min-width: 88px; }
-.ios-mobile-shell .settings-content { max-width: none; }
+.ios-mobile-shell .mobile-record-action {
+  min-width: 88px;
+}
+.ios-mobile-shell .settings-content {
+  max-width: none;
+}
 .ios-mobile-shell .auto-scope-grid,
 .ios-mobile-shell .about-grid {
   grid-template-columns: minmax(0, 1fr);
 }
-.ios-mobile-shell .category-policy-row { display: block; }
+.ios-mobile-shell .category-policy-row {
+  display: block;
+}
 .ios-mobile-shell .category-policy-actions {
   display: grid;
   width: 100%;
@@ -191,12 +222,21 @@ body {
 }
 
 @media (pointer: coarse) {
-  button, input, select { min-height: 44px; }
-  a, button { -webkit-tap-highlight-color: transparent; }
+  button,
+  input,
+  select {
+    min-height: 44px;
+  }
+  a,
+  button {
+    -webkit-tap-highlight-color: transparent;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  *,
+  *::before,
+  *::after {
     animation-duration: .001ms !important;
     transition-duration: .001ms !important;
   }

@@ -532,16 +532,18 @@ svg { display: block; }
  *  display names can embed attacker-controlled strings from page content or
  *  the bundled blacklist). */
 const esc = (s: string) =>
-  s.replace(/[<>&"]/g, (c) =>
-    ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" })[c] ?? c,
-  );
+  s.replace(/[<>&"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" })[c] ?? c);
 
 /** Only render avatar URLs that are plainly X CDN images. */
 const safeAvatarUrl = (url: string | undefined): string | undefined =>
   url && /^https:\/\/pbs\.twimg\.com\//.test(url) ? url : undefined;
 
 /** Inline status line inside a popover (举报 result). Text-only, no HTML. */
-function setPopStatus(el: HTMLElement | null | undefined, msg: string, kind: "info" | "ok" | "err") {
+function setPopStatus(
+  el: HTMLElement | null | undefined,
+  msg: string,
+  kind: "info" | "ok" | "err",
+) {
   if (!el) return;
   el.textContent = msg;
   el.dataset.kind = kind;
@@ -618,9 +620,6 @@ export interface BubbleOpts {
   autoProcess?: boolean;
   /** How many spam categories currently escalate beyond "badge". */
   autoCategoryCount?: number;
-  /** true = auto actions fire everywhere (settings.autoScope === "all");
-   *  false = replies-only (default scope). */
-  autoScopeAll?: boolean;
   /** Pop the card open when the auto queue starts (settings.autoExpand).
    *  false = stay collapsed; the pill's hit-pulse is the only signal. */
   autoExpand?: boolean;
@@ -691,7 +690,6 @@ export function createBubble(
   const archivedKeys = new Set<string>();
   let autoOn = opts.autoProcess ?? true;
   let autoCats = opts.autoCategoryCount ?? 0;
-  let autoScopeAll = opts.autoScopeAll ?? false;
   // Card list view: the live queue by default; "done" lists processed rows
   // behind the 已处理 chip so they don't pile up under the progress bar.
   let view: "queue" | "done" = "queue";
@@ -711,8 +709,7 @@ export function createBubble(
 
   // Must match content.ts keyOf(): userId first, `h:${handle}` fallback.
   const rowKey = (f: Finding) => f.userId || `h:${f.handle}`;
-  const stateOf = (f: Finding): RowState | "pending" =>
-    rowState.get(rowKey(f)) ?? "pending";
+  const stateOf = (f: Finding): RowState | "pending" => rowState.get(rowKey(f)) ?? "pending";
   const selectable = (f: Finding) => {
     if (autoRows.has(rowKey(f))) return false; // auto rows are not user-actionable
     if (archivedKeys.has(rowKey(f))) return false; // page context is gone
@@ -893,11 +890,7 @@ export function createBubble(
   /** Header-area 自动处理 switch + tiny hint showing how many categories the
    *  per-category policy currently escalates (options 页的分级策略). */
   function autoRowMarkup() {
-    const hint = autoOn
-      ? autoCats > 0
-        ? `${autoCats} 类自动 · ${autoScopeAll ? "全局" : "仅评论区"}`
-        : "全部仅标记"
-      : "已暂停 · 仅标记";
+    const hint = autoOn ? (autoCats > 0 ? `${autoCats} 类自动` : "全部仅标记") : "已暂停 · 仅标记";
     return `<div class="auto-row">
       <button class="xss-sw" data-auto role="switch" aria-checked="${autoOn}"
         aria-label="自动处理"></button>
@@ -924,9 +917,9 @@ export function createBubble(
           正在被动检查本页账号。发现可疑的垃圾/色情机器人时，会在这里提示并提供一键处理。</div>
         <div class="row"><span class="lnk" data-gov>为什么 / 治理</span></div>`;
       card.querySelector("[data-x]")?.addEventListener("click", collapseByUser);
-      card.querySelector("[data-gov]")?.addEventListener("click", () =>
-        window.open(BRAND.governance, "_blank", "noopener"),
-      );
+      card
+        .querySelector("[data-gov]")
+        ?.addEventListener("click", () => window.open(BRAND.governance, "_blank", "noopener"));
       bindAutoRow();
       return;
     }
@@ -941,10 +934,7 @@ export function createBubble(
     // earlier pages (an account can reappear live — the live row wins).
     const liveKeys = new Set(findings.map(rowKey));
     const archivedRows = archive.filter((a) => !liveKeys.has(rowKey(a)));
-    const doneRows = [
-      ...findings.filter((f) => absorbed.has(rowKey(f))),
-      ...archivedRows,
-    ];
+    const doneRows = [...findings.filter((f) => absorbed.has(rowKey(f))), ...archivedRows];
     if (view === "done" && !doneRows.length) view = "queue";
     // Queue view = live feed, newest activity first. A settled row lingers
     // here for a beat (visible ✓), then flies into the 已处理 chip — the
@@ -996,9 +986,7 @@ export function createBubble(
               ? `<img src="${esc(avUrl)}" class="qavatar" alt="">`
               : `<span class="qavatar blank"></span>`;
             const name = esc(f.displayName?.trim() || `@${f.handle}`);
-            const snip = f.snippet
-              ? esc(f.snippet.replace(/\s+/g, " ").trim()).slice(0, 60)
-              : "";
+            const snip = f.snippet ? esc(f.snippet.replace(/\s+/g, " ").trim()).slice(0, 60) : "";
             const id = rowKey(f);
             const isNew = !seenRows.has(id);
             seenRows.add(id);
@@ -1044,8 +1032,7 @@ export function createBubble(
                     : st === "failed"
                       ? "重试"
                       : verb;
-            const actDisabled =
-              isAuto || st === "done" || st === "processing" || st === "queued";
+            const actDisabled = isAuto || st === "done" || st === "processing" || st === "queued";
             return `<div class="${rowCls}" data-rk="${esc(id)}">
               <input type="checkbox" class="xss-row-cb" data-sel="${esc(id)}"
                 aria-label="选中 @${esc(f.handle)}"
@@ -1164,9 +1151,7 @@ export function createBubble(
       b.disabled = true;
       b.textContent = "处理中…";
       // Bulk only processes the SELECTED, untouched findings.
-      const keys = findings
-        .filter((f) => selectable(f) && !deselected.has(rowKey(f)))
-        .map(rowKey);
+      const keys = findings.filter((f) => selectable(f) && !deselected.has(rowKey(f))).map(rowKey);
       startBatch(keys);
     });
   }
@@ -1242,8 +1227,7 @@ export function createBubble(
     for (const key of keys) {
       const row = card.querySelector<HTMLElement>(`[data-rk="${CSS.escape(key)}"]`);
       const r0 = row?.getBoundingClientRect();
-      const visible =
-        !!row && !!r0?.width && r0.bottom > tb.top + 4 && r0.top < tb.bottom - 4;
+      const visible = !!row && !!r0?.width && r0.bottom > tb.top + 4 && r0.top < tb.bottom - 4;
       if (!row || !r0 || !visible) continue; // lands with the group, no ghost
       // Ghost lives on the bubble root: the queue-table clips overflow, so
       // the real row could never fly past the card edge.
@@ -1370,8 +1354,7 @@ export function createBubble(
     if (wasOpen) card.classList.add("closing");
   }
   card.addEventListener("animationend", (e) => {
-    if ((e as AnimationEvent).animationName === "cardout")
-      card.classList.remove("closing");
+    if ((e as AnimationEvent).animationName === "cardout") card.classList.remove("closing");
   });
   // Auto-show while the extension works: the card pops open when the AUTO
   // path starts acting, stays for the whole batch, then folds back a few
@@ -1550,11 +1533,7 @@ export function createBubble(
      *  here as the X action progresses. Marks the row as auto-driven —
      *  checkbox disabled, per-row button becomes a status chip. Chips,
      *  progress bar and the radar pill all re-derive from rowState. */
-    markAuto(
-      key: string,
-      st: "queued" | "processing" | "done" | "failed",
-      verbLabel?: string,
-    ) {
+    markAuto(key: string, st: "queued" | "processing" | "done" | "failed", verbLabel?: string) {
       autoRows.add(key);
       if (verbLabel) autoVerbs.set(key, verbLabel);
       rowState.set(key, st);
@@ -1587,11 +1566,10 @@ export function createBubble(
       scheduleAbsorb(key);
     },
     /** Sync the header switch when settings change elsewhere (options page
-     *  or another tab). Optionally refresh the category-count/scope hint. */
-    setAutoProcess(v: boolean, categoryCount?: number, scopeAll?: boolean) {
+     *  or another tab). Optionally refresh the category-count hint. */
+    setAutoProcess(v: boolean, categoryCount?: number) {
       autoOn = v;
       if (categoryCount !== undefined) autoCats = categoryCount;
-      if (scopeAll !== undefined) autoScopeAll = scopeAll;
       if (open) renderCard();
     },
     /** settings.actionMode changed: every rendered 隐藏/静音/拉黑 label must
@@ -1647,7 +1625,7 @@ const ACTION_LADDER: { mode: ActionMode; verb: string }[] = [
 /** Inline pill on the author row; hover/focus → popover with reasons. */
 /** source: 'fresh' = just classified (rise-in); 'list'/'cache' = already on
  *  record → instant calm "known" marker, no processing implied. */
-export type BadgeSource = "fresh" | "list" | "cache" | "rule";
+export type BadgeSource = "fresh" | "list" | "cache" | "rule" | "baseline" | "llm";
 
 // Popover overlay — a singleton shadow host attached directly under
 // <html>. Popovers must NOT live inside the badge's own shadow root: X's

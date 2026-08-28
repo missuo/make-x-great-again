@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getSettings } from "../lib/settings";
+import { DEFAULT_CATEGORY_ACTIONS, getSettings } from "../lib/settings";
 
 test("preserves X-native action settings across browser builds", async () => {
   const root = globalThis as unknown as { chrome?: unknown };
@@ -23,7 +23,9 @@ test("preserves X-native action settings across browser builds", async () => {
     assert.equal(settings.actionMode, "mute");
     assert.equal(settings.categoryActions.porn, "block");
     assert.equal(settings.categoryActions.crypto, "mute");
-    assert.equal(settings.categoryActions.gambling, "badge");
+    // 未存过的类别回落到默认值 —— 断言的是「合并行为」，不是某个具体
+    // 默认动作，否则默认口径一变这个用例就会假失败。
+    assert.equal(settings.categoryActions.gambling, DEFAULT_CATEGORY_ACTIONS.gambling);
   } finally {
     if (previousChrome === undefined) delete root.chrome;
     else root.chrome = previousChrome;

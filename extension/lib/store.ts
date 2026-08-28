@@ -26,6 +26,10 @@ export interface BlockRecord {
   /** Snapshot of the triggering text — survives tweet deletion. */
   tweetText?: string;
   source: BlockSource;
+  /** 在 X 上实际执行成功的动作。没有这个字段就无从知道该解除谁 ——
+   *  「恢复显示」曾经只能恢复本地可见，X 端要用户自己去手动解，而一次
+   *  误判清理可能涉及几十个账号。X 动作失败或纯本地隐藏时不写。 */
+  xAction?: "mute" | "block";
   ts: number;
 }
 
@@ -45,9 +49,7 @@ export interface PendingXAction {
 
 /** Permalink of the triggering tweet, when recorded. */
 export function tweetUrl(r: Pick<BlockRecord, "handle" | "tweetId">): string | null {
-  return r.tweetId
-    ? `https://x.com/${encodeURIComponent(r.handle)}/status/${r.tweetId}`
-    : null;
+  return r.tweetId ? `https://x.com/${encodeURIComponent(r.handle)}/status/${r.tweetId}` : null;
 }
 
 export interface Stats {

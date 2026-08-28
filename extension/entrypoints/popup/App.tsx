@@ -4,9 +4,7 @@ import { getSettings } from "../../lib/settings";
 import type { BgResponse } from "../../lib/types";
 
 function bg<T = Record<string, unknown>>(msg: unknown): Promise<BgResponse & { data?: T }> {
-  return new Promise((r) =>
-    chrome.runtime.sendMessage(msg, (resp) => r(resp ?? { ok: false })),
-  );
+  return new Promise((r) => chrome.runtime.sendMessage(msg, (resp) => r(resp ?? { ok: false })));
 }
 
 interface LocalStats {
@@ -80,15 +78,11 @@ export function App() {
   return (
     <div className="p-4">
       <header className="flex items-center gap-2">
-        <img
-          src={MASCOT_URL}
-          alt=""
-          width={26}
-          height={26}
-          className="rounded-md"
-        />
+        <img src={MASCOT_URL} alt="" width={26} height={26} className="rounded-md" />
         <b className="text-[14px] font-semibold tracking-[-.005em]">{BRAND.acronym}</b>
-        <span className="text-[10.5px] font-medium uppercase tracking-[0.08em] text-fg-4">{BRAND.name}</span>
+        <span className="text-[10.5px] font-medium uppercase tracking-[0.08em] text-fg-4">
+          {BRAND.name}
+        </span>
         <span
           aria-label={status === null ? "检查中" : status.ok ? "名单已同步" : "名单同步失败"}
           className={`ml-auto inline-flex h-2 w-2 rounded-full ${
@@ -101,8 +95,7 @@ export function App() {
       <div className="mt-3 rounded-md border border-border bg-card px-3 py-2.5">
         <div className="text-[10.5px] font-medium uppercase tracking-[0.08em] text-fg-3">
           小蓝陪你
-          <span className="mx-1 font-mono text-fg-2 tabular-nums">{fmt(days)}</span>
-          天 · 一起干掉
+          <span className="mx-1 font-mono text-fg-2 tabular-nums">{fmt(days)}</span>天 · 一起干掉
         </div>
         <div className="mt-1 flex items-baseline gap-1.5">
           <span className="font-mono text-[26px] font-bold leading-none tabular-nums tracking-tight text-fg">
@@ -144,9 +137,7 @@ export function App() {
 
       <button
         type="button"
-        onClick={() =>
-          chrome.tabs.create({ url: chrome.runtime.getURL("options.html") })
-        }
+        onClick={() => chrome.tabs.create({ url: chrome.runtime.getURL("options.html") })}
         className="mt-3 w-full cursor-pointer rounded-md border border-fg bg-fg px-3 py-2.5 text-[13px] font-semibold text-bg transition hover:opacity-90 active:translate-y-px"
       >
         打开管理面板
@@ -166,7 +157,7 @@ export function App() {
         <a
           href={`${edgeBase}/list`}
           target="_blank"
-          rel="noopener"
+          rel="noreferrer noopener"
           className="rounded-md border border-border-2 px-2.5 py-1.5 text-center text-[12px] text-fg-2 transition hover:bg-card-hi hover:text-fg"
         >
           看公榜
@@ -174,7 +165,7 @@ export function App() {
         <a
           href={BRAND.repo}
           target="_blank"
-          rel="noopener"
+          rel="noreferrer noopener"
           className="rounded-md border border-border-2 px-2.5 py-1.5 text-center text-[12px] text-fg-2 transition hover:bg-card-hi hover:text-fg"
         >
           GitHub
@@ -185,7 +176,7 @@ export function App() {
         <a
           href={BRAND.governance}
           target="_blank"
-          rel="noopener"
+          rel="noreferrer noopener"
           className="text-fg-2 hover:text-fg"
         >
           为什么 / 治理

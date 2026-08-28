@@ -10,6 +10,35 @@ otherwise.
 
 ### Added
 
+- **Self-learning classifier layer.** Every manual block now feeds the model
+  instead of dying in `chrome.storage`. Learned rules live in a two-tier state
+  machine — `candidate` sends a hit to the LLM for review, `trusted` blocks
+  outright — so a badly learned rule costs one API call, never a false block.
+  Promotion to `trusted` requires 8+ distinct accounts, a 100% spam verdict rate,
+  zero user restores, and a clean rescan against the negative corpus.
+- **Whole-tweet templates for spam with no extractable keyword.** Families like
+  `30+的cb体制内老师 已探路花样多 @x 1s` share no single convicting word, only a
+  verbatim prefix. Each manual block stores the stripped original; later tweets
+  match on `max(longest-common-substring ratio, 3-gram Jaccard)` at a tunable
+  threshold (≥0.45 block, ≥0.30 LLM review). Measured: in-family variants
+  0.54–1.00, templates vs. 20 normal tweets 0.000 across the board.
+- **Noise stripping before similarity** — @-mention targets, links, and 1–3 char
+  alphanumeric fillers. Without it the target sample pair scores 0.087 instead
+  of 0.50; it is a precondition, not an optimization.
+- **Word-internal filler normalization** (`INFIX_FILLER`): 1–3 char alphanumeric
+  runs wedged *between two CJK characters* are dropped, defeating the
+  `主页h6能打` evasion. Guarded to require CJK on both sides, cap at 3 chars, and
+  never strip pure digits (`线下资源1-5线` depends on them).
+- **「模型学习」options page**: runtime LLM config with a connection test, the
+  learned-rule list with promote/retire/delete, template threshold sliders,
+  manual rule entry, a no-side-effect 试学 dry run, LLM consolidation proposals
+  requiring per-item approval, and rule import/export.
+- `scripts/release-zip.sh` (`npm run release:zip`): the only sanctioned way to
+  produce a distributable zip. It moves `extension/.env` aside so build-time
+  `WXT_LLM_*` injection cannot bake an API key into `background.js`, then
+  rescans the artifacts for both the literal `.env` values and generic key
+  shapes, exiting non-zero on any hit.
+
 - iOS / iPadOS 18+ Safari Web Extension container with a SwiftUI setup guide,
   Simulator build script, shared MV3 resources, and iPhone/iPad icons.
 - Touch-first badge popovers plus an iOS hamburger drawer, single-column dashboard cards,
@@ -19,11 +48,29 @@ otherwise.
 
 ### Changed
 
+- LLM base URL / key / model moved from build-time `.env` injection to
+  `chrome.storage.local`, editable in the options page. `.env` degrades to a
+  first-install seed.
+- Settings simplified: `autoScope`, `autoTierMode`, and the per-category action
+  grid are gone along with the public-list and official-keyword sources they
+  gated. `categoryActions` survives in the data model; the UI collapses to one
+  「命中后的动作」selector. `autoEligible` collapses from five branches to one line.
+
 - Consolidated the macOS and iOS containers and Safari extensions into one Xcode project with
   four platform-specific targets; deployment baselines are now macOS 15 and iOS 18.
 - Safari's in-page blacklist index now retains compact lite rows and expands display data only
   on a hit, reducing the measured retained heap for the current 134k snapshot from roughly
   55 MB to 32 MB per page context.
+
+### Fixed
+
+- `比我好看的没我Sao…没我Sao的` and similar pinyin evasions: `sao` / `pao`
+  adjacent to any CJK character now normalize, not just before a fixed
+  货/逼/友 whitelist.
+- Display names containing `返佣` now convict as `crypto` on the account's own
+  fields.
+- 「主页能打」promoted to a curated hard-ban phrase; it previously only appeared
+  in the bait-word table, which additionally requires an @-redirect.
 
 ## [0.5.0] - 2026-07-18
 

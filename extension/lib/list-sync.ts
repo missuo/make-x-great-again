@@ -282,48 +282,20 @@ async function syncWhitelist(base: string): Promise<number | undefined> {
   }
 }
 
-async function doSync(force: boolean): Promise<SyncResult> {
+async function doSync(_force: boolean): Promise<SyncResult> {
+  // 远端黑名单已停用（2026-08-08）。判定完全由本地 baseline + 大模型承担；
+  // 那份公榜里 27.7% 的条目由泛化词单独命中产生，并且会把正常账号标成
+  // human 层让客户端直接执行动作 —— 一份我们既不控制也审不了的名单，不该
+  // 有替用户做不可逆动作的权力。
+  //
+  // 白名单**继续同步**：它只会阻止动作、从不产生动作，是对 baseline 和
+  // 大模型自身误判的最后一道保险，留着只有好处。
   try {
     const base = await edgeBase();
-    // Whitelist first: it is a few KB and must stay fresh even when the
-    // blacklist version hasn't moved (an appeal that whitelists someone
-    // should reach clients on the next sync, not the next list release).
     const white = await syncWhitelist(base);
-
-    const metaRes = await fetch(`${base}/v1/list/meta`, { cache: "no-cache" });
-    if (!metaRes.ok) return { updated: false, white, error: `meta ${metaRes.status}` };
-    const meta = (await readJsonBounded(metaRes, MAX_META_BYTES)) as ListMeta;
-    const litePath = meta.artifacts?.lite;
-    if (!litePath || !ARTIFACT_PATH_RE.test(litePath)) {
-      return { updated: false, white, error: "invalid lite artifact path" };
-    }
-
-    const stored = await getStoredList();
-    if (!force && stored && meta.version && stored.version === meta.version) {
-      return { updated: false, version: stored.version, black: stored.count, white };
-    }
-
-    const liteRes = await fetch(`${base}${litePath}`);
-    if (!liteRes.ok) return { updated: false, white, error: `lite ${liteRes.status}` };
-    const validated = validateLiteArtifact(
-      await readJsonBounded(liteRes, MAX_LITE_BYTES),
-      { dropInvalidEntries: true },
-    );
-    if (!validated.ok) return { updated: false, white, error: validated.error };
-    const { entries, rules, version } = validated.value;
-    if (entries.length < MIN_SANE_ENTRIES) {
-      return { updated: false, white, error: `implausibly small list (${entries.length})` };
-    }
-
-    const next: StoredList = {
-      version: version ?? meta.version ?? `n${entries.length}`,
-      fetchedAt: Date.now(),
-      count: entries.length,
-      entries,
-      ...(rules ? { rules } : {}),
-    };
-    await chrome.storage.local.set({ [LIST_KEY]: next });
-    return { updated: true, version: next.version, black: next.count, white };
+    // 清掉历史缓存的黑名单，否则老装机会继续拿旧数据匹配。
+    await chrome.storage.local.remove(LIST_KEY);
+    return { updated: false, white, black: 0 };
   } catch (e) {
     return { updated: false, error: e instanceof Error ? e.message : String(e) };
   }
